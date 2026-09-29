@@ -264,6 +264,93 @@ describe("session lifecycle state", () => {
     },
   );
 
+  it("preserves an accepted chat claim through a foreign announcement lifecycle", async () => {
+    const accepted: SessionEntry = {
+      sessionId: "accepted-session",
+      updatedAt: 1_000,
+      startedAt: 1_000,
+      status: "running",
+      abortedLastRun: false,
+      lifecycleRunId: "accepted-run",
+      restartRecoverySourceIngress: "control-ui",
+      restartRecoveryDeliveryRunId: "accepted-run",
+      restartRecoveryDeliverySourceRunId: "accepted-run",
+      restartRecoveryDeliveryRequestFingerprint: "synthetic-request-fingerprint",
+    };
+    let current = accepted;
+    for (const phase of ["start", "end", "error"] as const) {
+      const announcement: LifecycleEvent = {
+        sessionId: accepted.sessionId,
+        runId: "announcement-run",
+        ts: 3_000,
+        data: {
+          phase,
+          startedAt: 2_000,
+          endedAt: 3_000,
+          ...(phase === "error" ? { error: "announcement failed" } : {}),
+        },
+      };
+      current = await persistLifecycle(current, announcement);
+      expect(current).toEqual(accepted);
+    }
+    // Its own cancellation, including the provider/client alias, still settles.
+    for (const runId of ["accepted-run", "provider-run"]) {
+      const cancelled = await persistLifecycle(current, {
+        sessionId: accepted.sessionId,
+        runId,
+        clientRunId: "accepted-run",
+        ts: 4_000,
+        data: {
+          phase: "end",
+          startedAt: 1_000,
+          endedAt: 4_000,
+          aborted: true,
+          stopReason: "aborted",
+        },
+      });
+      expect(cancelled).toMatchObject({
+        status: "killed",
+        abortedLastRun: true,
+        lastRunId: "accepted-run",
+      });
+    }
+  });
+
+  it.each(["adopted", "terminal-receipt", "channel"] as const)(
+    "retains normal lifecycle projection for %s recovery",
+    async (kind) => {
+      const entry: SessionEntry = {
+        sessionId: "claimed-session",
+        updatedAt: 1_000,
+        startedAt: 1_000,
+        status: "running",
+        lifecycleRunId: "original-run",
+        restartRecoverySourceIngress: kind === "channel" ? "channel" : "control-ui",
+        restartRecoveryDeliveryRunId: "original-run",
+        restartRecoveryDeliverySourceRunId: "original-run",
+        restartRecoveryDeliveryRequestFingerprint:
+          kind === "adopted" ? undefined : "synthetic-request-fingerprint",
+        ...(kind === "terminal-receipt"
+          ? { restartRecoveryDeliveryReceiptState: "terminal-pending" as const }
+          : {}),
+      };
+      const started = await persistLifecycle(entry, {
+        sessionId: entry.sessionId,
+        runId: "announcement-run",
+        ts: 2_000,
+        data: { phase: "start", startedAt: 2_000 },
+      });
+      expect(started.lifecycleRunId).toBe("announcement-run");
+      const completed = await persistLifecycle(started, {
+        sessionId: entry.sessionId,
+        runId: "announcement-run",
+        ts: 3_000,
+        data: { phase: "end", startedAt: 2_000, endedAt: 3_000 },
+      });
+      expect(completed).toMatchObject({ status: "done", lastRunId: "announcement-run" });
+    },
+  );
+
   it("settles a same-run terminal event whose outer start time predates its embedded start", async () => {
     const started = await persistLifecycle(
       { sessionId: "session-id", updatedAt: 900 },

@@ -460,6 +460,23 @@ export async function persistGatewaySessionLifecycleEvent(params: {
       }
       const eventRunId = normalizeLifecycleRunId(params.event.runId);
       const eventClientRunId = normalizeLifecycleRunId(params.event.clientRunId);
+      const reservedChatRunId = entry.restartRecoveryDeliveryRunId;
+      if (
+        entry.status === "running" &&
+        entry.abortedLastRun !== true &&
+        entry.restartRecoverySourceIngress === "control-ui" &&
+        entry.restartRecoveryDeliveryRequestFingerprint &&
+        entry.restartRecoveryDeliveryReceiptState !== "terminal-pending" &&
+        reservedChatRunId &&
+        entry.restartRecoveryDeliverySourceRunId === reservedChatRunId &&
+        entry.lifecycleRunId === reservedChatRunId &&
+        eventRunId !== reservedChatRunId &&
+        eventClientRunId !== reservedChatRunId
+      ) {
+        // Pre-ACK persistence reserves this lifecycle until agent adoption clears
+        // its verifier. An announcement cannot terminalize the accepted input.
+        return null;
+      }
       const terminalRunId = normalizeLifecycleRunId(entry.lastRunId);
       if (
         phase === "start" &&
