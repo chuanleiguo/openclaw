@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import type { Worker, WorkerOptions } from "node:worker_threads";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
@@ -16,7 +17,7 @@ import {
 } from "../../plugins/registry-lifecycle.js";
 import { withPluginRuntimeRegistryScope } from "../../plugins/runtime/gateway-request-scope.js";
 import { createPluginRecord } from "../../plugins/status.test-helpers.js";
-import { closeMaintenanceAgentDatabase } from "../../state/openclaw-agent-db-lifecycle.js";
+import { closeCachedOpenClawAgentDatabase } from "../../state/openclaw-agent-db-lifecycle.js";
 import { invalidateOpenClawAgentDatabaseValidation } from "../../state/openclaw-agent-db-validation-cache.js";
 import {
   closeOpenClawAgentDatabaseByPath,
@@ -43,12 +44,12 @@ import {
   applySessionEntryMaintenance,
   finalizeSessionEntryMaintenancePlansAfterWriterReleaseBestEffort,
 } from "./session-accessor.sqlite-maintenance.js";
+import { holdReclamationAdmission } from "./session-accessor.sqlite-prepared-admission.test-support.js";
 import {
   applySessionEntryLifecycleMutation,
   applySessionEntryReplacements,
   applySessionStoreProjection,
 } from "./session-accessor.sqlite-projection.js";
-import * as reclamationWorker from "./session-accessor.sqlite-reclamation-worker.js";
 import {
   resolveSqliteScope,
   resolveSqliteTranscriptArchiveDirectory,
@@ -61,33 +62,44 @@ const hooks = vi.hoisted(() => ({
   afterMaterialize: undefined as (() => Promise<void>) | undefined,
   integrityChecks: undefined as SharedArrayBuffer | undefined,
   integrityRelease: undefined as SharedArrayBuffer | undefined,
-  worker: undefined as ((worker: Worker) => void) | undefined,
+  integrityPath: undefined as string | undefined,
+  worker: undefined as ((worker: Worker, phase: "checking" | "checked") => void) | undefined,
 }));
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:worker_threads")>();
   return {
     ...actual,
     Worker: class extends actual.Worker {
+      private readonly integrityProbe: typeof hooks.worker;
+
       constructor(filename: string | URL, options?: WorkerOptions) {
-        const workerData: unknown = options?.workerData;
-        const reclamation =
-          workerData !== null &&
-          typeof workerData === "object" &&
-          "operation" in workerData &&
-          workerData.operation === "reclaim";
         super(
           filename,
-          reclamation
-            ? withWorkerSqliteIntegrityCounter(
-                options,
-                hooks.integrityChecks,
-                hooks.integrityRelease,
-              )
-            : options,
+          withWorkerSqliteIntegrityCounter(
+            options,
+            hooks.integrityChecks,
+            hooks.integrityRelease,
+            hooks.integrityPath,
+          ),
         );
-        if (reclamation) {
-          hooks.worker?.(this);
+        this.integrityProbe = hooks.worker;
+      }
+
+      override emit(event: string | symbol, ...args: unknown[]): boolean {
+        const message = args[0];
+        if (
+          this.integrityProbe &&
+          event === "message" &&
+          args.length === 1 &&
+          isRecord(message) &&
+          Object.keys(message).length === 2 &&
+          message.type === "test-integrity-check" &&
+          (message.phase === "checking" || message.phase === "checked")
+        ) {
+          this.integrityProbe(this, message.phase);
+          return true;
         }
+        return super.emit(event, ...args);
       }
     },
   };
@@ -140,6 +152,7 @@ afterEach(async () => {
   hooks.afterMaterialize = undefined;
   hooks.integrityChecks = undefined;
   hooks.integrityRelease = undefined;
+  hooks.integrityPath = undefined;
   hooks.worker = undefined;
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
@@ -302,47 +315,30 @@ function observeAdmission(databasePath: string, hold = false) {
 
 function observeWorkerAdmission(databasePath: string, hold: boolean) {
   const parent = observeAdmission(databasePath);
-  const entered = createDeferred();
+  const admission = holdReclamationAdmission(databasePath, "maintenance-finalize", "before-writer");
+  releases.push(() => admission.release.resolve());
+  if (!hold) {
+    admission.release.resolve();
+  }
   const counts = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   const release = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-  const resume = () => {
-    Atomics.store(new Int32Array(release), 0, 1);
-    Atomics.notify(new Int32Array(release), 0);
-  };
-  releases.push(resume);
-  if (!hold) {
-    resume();
-  }
+  // Observe native integrity without parking the shared foreground command carrier.
+  Atomics.store(new Int32Array(release), 0, 1);
   hooks.integrityChecks = counts;
   hooks.integrityRelease = release;
+  hooks.integrityPath = databasePath;
   const workers: Worker[] = [];
   let completed = 0;
-  hooks.worker = (worker) => {
-    workers.push(worker);
-    worker.on("message", (message: { type?: string; phase?: string }) => {
-      if (message.type !== "test-integrity-check") {
-        return;
-      }
-      if (message.phase === "checking") {
-        entered.resolve();
-      } else if (message.phase === "checked") {
-        completed += 1;
-      }
-    });
+  hooks.worker = (worker, phase) => {
+    if (phase === "checking") {
+      workers.push(worker);
+    } else {
+      completed += 1;
+    }
   };
   return {
-    release: { resolve: resume },
-    async expectPending(operation: Promise<unknown>) {
-      expect(
-        await Promise.race([
-          entered.promise.then(() => "worker"),
-          operation.then(
-            () => "completed",
-            () => "failed",
-          ),
-        ]),
-      ).toBe("worker");
-    },
+    release: admission.release,
+    expectPending: (operation: Promise<unknown>) => admission.expectPending(operation),
     async expectHealthy(count: number) {
       parent.expectHealthy(0);
       expect(Atomics.load(new Int32Array(counts), 0)).toBe(count);
@@ -631,36 +627,16 @@ it("reacquires post-builder references before planning lifecycle transcript dele
   expect(loadTranscriptEventsSync(transcript.scope)).toEqual(transcript.events);
 });
 
-it("reacquires the split lifecycle commit after real archive materialization", async () => {
+it("reacquires the split lifecycle writer after archive materialization with retained admission", async () => {
   const f = fixture();
   const transcript = seedTranscript(f);
-  const probe = observeWorkerAdmission(f.databasePath, true);
-  const commitRequested = createDeferred();
-  const commitRelease = createDeferred();
-  releases.push(() => commitRelease.resolve());
-  let closePlanningWorker: (() => Promise<void>) | undefined;
-  // oxlint-disable-next-line typescript/unbound-method -- Pass-through spy invokes the method with its original Worker receiver via call below.
-  const execute = reclamationWorker.SqliteReclamationWorker.prototype.run;
-  vi.spyOn(reclamationWorker.SqliteReclamationWorker.prototype, "run").mockImplementation(function (
-    this: reclamationWorker.SqliteReclamationWorker,
-    params,
-  ) {
-    if (params.plan.kind === "lifecycle-projection-plan") {
-      closePlanningWorker = () => this.close();
-    }
-    return execute.call(
-      this,
-      params.plan.kind === "lifecycle-projection-commit"
-        ? {
-            ...params,
-            onCommitRequest: () => {
-              void own(commitRelease.promise.then(() => params.onCommitRequest()));
-              commitRequested.resolve();
-            },
-          }
-        : params,
-    );
-  });
+  const probe = observeAdmission(f.databasePath);
+  const admission = holdReclamationAdmission(
+    f.databasePath,
+    "lifecycle-projection-commit",
+    "inside-writer",
+  );
+  releases.push(() => admission.release.resolve());
   let materializations = 0;
   let preparationWriterRan = false;
   hooks.afterMaterialize = async () => {
@@ -672,18 +648,10 @@ it("reacquires the split lifecycle commit after real archive materialization", a
       },
       "session.transcript.batch",
     );
-    if (!closePlanningWorker) {
-      throw new Error("Expected the completed lifecycle planning Worker");
+    const cached = getOpenClawAgentDatabaseIfOpen(f.options);
+    if (cached) {
+      closeCachedOpenClawAgentDatabase(cached, { eviction: true });
     }
-    await closePlanningWorker();
-    const database = getOpenClawAgentDatabaseIfOpen(f.options);
-    if (!database) {
-      throw new Error("Expected the original host database publication");
-    }
-    // Retire native handles without revoking the deletion's live execution authority.
-    closeMaintenanceAgentDatabase(database);
-    invalidateOpenClawAgentDatabaseValidation(f.databasePath);
-    clearOpenClawAgentIntegrityVerification(f.databasePath, f.input.env);
   };
   const work = own(
     applySessionEntryLifecycleMutation({
@@ -692,15 +660,7 @@ it("reacquires the split lifecycle commit after real archive materialization", a
       removals: [{ sessionKey: f.input.sessionKey, archiveRemovedTranscript: true }],
     }),
   );
-  await probe.expectPending(work);
-  // Cold validation releases its preliminary permit; the commit reacquires the FIFO.
-  probe.release.resolve();
-  await Promise.race([
-    commitRequested.promise,
-    work.then(() => {
-      throw new Error("Lifecycle deletion completed without its commit request");
-    }),
-  ]);
+  await admission.expectPending(work);
   let laterRan = false;
   const later = own(
     runExclusiveSqliteSessionWrite(
@@ -715,7 +675,7 @@ it("reacquires the split lifecycle commit after real archive materialization", a
   expect(laterRan).toBe(false);
   expect(preparationWriterRan).toBe(true);
   expect(loadSessionEntryReadOnly(f.input)?.sessionId).toBe("original");
-  commitRelease.resolve();
+  admission.release.resolve();
   const result = await work;
   await later;
   expect(materializations).toBe(1);
@@ -728,7 +688,8 @@ it("reacquires the split lifecycle commit after real archive materialization", a
   ).toBe(true);
   expect(loadSessionEntryReadOnly(f.input)).toBeUndefined();
   expect(loadTranscriptEventsSync(transcript.scope)).toEqual([]);
-  await probe.expectHealthy(1);
+  // Cache eviction preserves the native admission and its completed integrity proof.
+  probe.expectHealthy(0);
 });
 
 it.each([false, true])(
