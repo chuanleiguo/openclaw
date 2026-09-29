@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import type { Worker } from "node:worker_threads";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { vi } from "vitest";
+import { expect, vi } from "vitest";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import * as workerAdmission from "../../infra/sqlite-worker-operation-admission.js";
 import { readOpenClawAgentDatabaseWorkerLeaseReceipt } from "../../state/openclaw-agent-db-lifecycle.js";
@@ -40,7 +40,13 @@ export function createFixture(sessionIds = ["first", "second"], agentId = "main"
       materializedPlans: [],
     }),
   );
-  return { options, scopes, database, plans };
+  return {
+    options,
+    scopes,
+    database,
+    plans,
+    replaceDatabaseFileWithCopy: () => replaceDatabaseFileWithCopy(database.path),
+  };
 }
 
 export function observeReclamationWorkers(onSpawn?: (worker: Worker) => void) {
@@ -148,5 +154,16 @@ export function observeReclamationLeaseReceipts(database: { agentId: string; pat
       });
     },
     read: () => ({ admittedLeaseId, reclamationLeaseId }),
+  };
+}
+
+function replaceDatabaseFileWithCopy(databasePath: string) {
+  const original = fs.readFileSync(databasePath);
+  const retiredPath = databasePath + ".retired";
+  fs.renameSync(databasePath, retiredPath);
+  fs.copyFileSync(retiredPath, databasePath);
+  return () => {
+    expect(fs.readFileSync(retiredPath)).toEqual(original);
+    expect(fs.readFileSync(databasePath)).toEqual(original);
   };
 }

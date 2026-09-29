@@ -1,7 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { channel } from "node:diagnostics_channel";
 import { once } from "node:events";
-import fs from "node:fs";
 import { performance } from "node:perf_hooks";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import type { Worker, WorkerOptions } from "node:worker_threads";
@@ -76,6 +75,7 @@ import {
   tempDirs,
 } from "./session-accessor.sqlite-reclamation-reuse.test-support.js";
 import { runSqliteSessionReclamation } from "./session-accessor.sqlite-reclamation-run.js";
+import { SqliteReclamationWorker } from "./session-accessor.sqlite-reclamation-worker-lifetime.js";
 import * as reclamationWorker from "./session-accessor.sqlite-reclamation-worker.js";
 import type { SqliteReclamationWorkerMessage } from "./session-accessor.sqlite-reclamation-worker.types.js";
 import * as reclamation from "./session-accessor.sqlite-reclamation.js";
@@ -463,7 +463,8 @@ test.each([
         expect(checks).toBeGreaterThan(1);
         expect(loadSessionEntryReadOnly(scopes[index]!)).toBeUndefined();
       }
-      expect([spawned.length, fullChecks()]).toEqual([cold ? 2 : 1, 1]);
+      expect(spawned).toHaveLength(cold ? 2 : 1);
+      expect(fullChecks()).toBe(1);
       expect(diagnostics[0]?.workerThreadId).toBeGreaterThan(0);
       if (cold) {
         expect(diagnostics[1]?.workerThreadId).not.toBe(diagnostics[0]?.workerThreadId);
@@ -479,9 +480,10 @@ test.each([
       }
       expect(reclamationLeaseId).not.toBe(admittedLeaseId);
       const held = leasesFor(fixture);
-      const ids = held.map((row) => row.lease_id);
-      expect(ids.toSorted((a, b) => String(a).localeCompare(String(b)))).toEqual(
-        cold ? [reclamationLeaseId] : [admittedLeaseId, reclamationLeaseId].toSorted(),
+      // Cold preparation owns only the reclaimer; it does not open a foreground actor.
+      expect(held).toHaveLength(cold ? 1 : 2);
+      expect(new Set(held.map((row) => row.lease_id))).toEqual(
+        new Set(cold ? [reclamationLeaseId] : [admittedLeaseId, reclamationLeaseId]),
       );
     } finally {
       await closeOpenClawAgentDatabaseByPathAsync(database.path);
@@ -559,12 +561,12 @@ test.each(["path", "root", "replacement"] as const)(
     const enteredQueue = createDeferredCore();
     const releaseQueue = createDeferredCore();
     const enqueued = createDeferredCore();
-    const observed: { claim?: reclamationWorker.SqliteReclamationClaim } = {};
+    const observed: { assertCurrent?: () => void } = {};
     const withWorker = reclamationWorker.withSqliteReclamationWorker;
     vi.spyOn(reclamationWorker, "withSqliteReclamationWorker").mockImplementation(
       (options, claim, run, assertRequestCurrent, signal) => {
         const result = withWorker(options, claim, run, assertRequestCurrent, signal);
-        observed.claim = claim;
+        observed.assertCurrent = assertRequestCurrent;
         enqueued.resolve();
         return result;
       },
@@ -581,39 +583,34 @@ test.each(["path", "root", "replacement"] as const)(
     let closing: Promise<unknown> | undefined;
     try {
       await Promise.race([enqueued.promise, request]);
-      const claim = observed.claim;
-      if (!claim) {
-        throw new Error("Expected reclamation to retain its execution authority");
+      const assertCurrent = observed.assertCurrent;
+      if (!assertCurrent) {
+        throw new Error("Expected reclamation to retain its original opening authority");
       }
-      expect(() => claim.assertCurrent()).not.toThrow();
+      expect(assertCurrent).not.toThrow();
       if (retirement === "replacement") {
-        const original = fs.readFileSync(fixture.database.path);
-        const retiredPath = fixture.database.path + ".retired";
-        fs.renameSync(fixture.database.path, retiredPath);
-        fs.copyFileSync(retiredPath, fixture.database.path);
-        expect(() => claim.assertCurrent()).toThrow("file identity changed");
+        const expectFilesUnchanged = fixture.replaceDatabaseFileWithCopy();
         releaseQueue.resolve();
         await holding;
-        await expect(request).rejects.toThrow("file identity changed");
-        expect([spawned.length, leasesFor(fixture).length]).toEqual([0, 0]);
-        expect(fs.readFileSync(retiredPath)).toEqual(original);
-        expect(fs.readFileSync(fixture.database.path)).toEqual(original);
+        await expect(request).rejects.toThrow(/identity.*changed|replaced/);
+        expect(spawned).toHaveLength(0);
+        expect(leasesFor(fixture)).toHaveLength(0);
+        expectFilesUnchanged();
         return;
       }
       closing =
         retirement === "path"
           ? closeOpenClawAgentDatabaseByPathAsync(fixture.database.path)
           : closeOpenClawAgentDatabasesAsync(fixture.options.env.OPENCLAW_STATE_DIR);
-      expect(() => claim.assertCurrent()).toThrow("Agent database execution admission is closed");
-      expect([spawned.length, unrelatedSettled]).toEqual([0, false]);
+      expect(assertCurrent).toThrow("SQLite mutation Worker request was revoked");
+      expect(spawned).toHaveLength(0);
+      expect(unrelatedSettled).toBe(false);
       await Promise.all([
         expect(request).rejects.toThrow(/revoked|no longer current|admission.*changed/i),
         closing,
       ]);
       expect(unrelatedSettled).toBe(false);
-      expect(() => claim.assertCurrent()).toThrow(
-        /revoked|no longer current|retired|retiring|released/i,
-      );
+      expect(assertCurrent).toThrow(/revoked|no longer current|retired|retiring|released/i);
       expect(spawned).toHaveLength(0);
       expect(loadSessionEntryReadOnly(fixture.scopes[0]!)).toMatchObject({ sessionId: "first" });
       expect(leasesFor(fixture)).toHaveLength(0);
@@ -815,7 +812,7 @@ test.each(["idle", "active"] as const)(
     validation.admissionPath = fixture.database.path;
     closeOpenClawAgentDatabasesForTest(fixture.options.env.OPENCLAW_STATE_DIR);
     clearOpenClawAgentIntegrityVerification(fixture.database.path, fixture.options.env);
-    const close = vi.spyOn(reclamationWorker.SqliteReclamationWorker.prototype, "close");
+    const close = vi.spyOn(SqliteReclamationWorker.prototype, "close");
     let drainOnCommit = false;
     let closesAtDrain: number | undefined;
     let nativeClosesAtDrain: number | undefined;
@@ -835,20 +832,23 @@ test.each(["idle", "active"] as const)(
     expect(reclamationLeaseId).toBeDefined();
     expect(reclamationLeaseId).not.toBe(admittedLeaseId);
     const held = leasesFor(fixture);
-    expect(held.map((row) => row.lease_id)).toEqual([reclamationLeaseId]);
+    expect(held).toHaveLength(1);
+    expect(new Set(held.map((row) => row.lease_id))).toEqual(new Set([reclamationLeaseId]));
     expect(fullChecks()).toBe(1);
     if (timing === "active") {
       drainOnCommit = true;
       await expect(
         runSqliteSessionReclamation({ forceInProcess: false, plan: fixture.plans[1]! }),
       ).resolves.toMatchObject({ kind: "lifecycle-artifacts", value: { removedEntries: 1 } });
-      expect([closesAtDrain, nativeClosesAtDrain]).toEqual([0, 0]);
+      expect(closesAtDrain).toBe(0);
+      expect(nativeClosesAtDrain).toBe(0);
       expect(loadSessionEntryReadOnly(fixture.scopes[1]!)).toBeUndefined();
     } else {
       markGatewayRestartDraining("restart (SIGTERM)");
     }
     // Join the real native retirement without a timer or a whole-Gateway close.
-    expect([close.mock.calls.length, nativeCloses.length]).toEqual([1, 0]);
+    expect(close).toHaveBeenCalledOnce();
+    expect(nativeCloses).toHaveLength(0);
     await Promise.all([close.mock.results[0]?.value, ...nativeCloses]);
     expect(spawned[0]?.threadId).toBe(-1);
     expect(leasesFor(fixture)).toHaveLength(0);
@@ -860,7 +860,8 @@ test.each(["idle", "active"] as const)(
     await expect(
       runSqliteSessionReclamation({ forceInProcess: false, plan: fixture.plans[2]! }),
     ).resolves.toMatchObject({ kind: "lifecycle-artifacts", value: { removedEntries: 1 } });
-    expect([spawned.length, fullChecks()]).toEqual([2, 1]);
+    expect(spawned).toHaveLength(2);
+    expect(fullChecks()).toBe(1);
   },
 );
 

@@ -649,9 +649,11 @@ it("reacquires the split lifecycle writer after archive materialization with ret
       "session.transcript.batch",
     );
     const cached = getOpenClawAgentDatabaseIfOpen(f.options);
-    if (cached) {
-      closeCachedOpenClawAgentDatabase(cached, { eviction: true });
+    if (!cached) {
+      throw new Error("Fixture lost its cached handle before materialization");
     }
+    closeCachedOpenClawAgentDatabase(cached, { eviction: true });
+    expect(cached.db.isOpen).toBe(false);
   };
   const work = own(
     applySessionEntryLifecycleMutation({
@@ -690,6 +692,7 @@ it("reacquires the split lifecycle writer after archive materialization with ret
   expect(loadTranscriptEventsSync(transcript.scope)).toEqual([]);
   // Cache eviction preserves the native admission and its completed integrity proof.
   probe.expectHealthy(0);
+  expect(admission.count()).toBe(1);
 });
 
 it.each([false, true])(
@@ -917,7 +920,7 @@ function maintenancePlan(f: ReturnType<typeof maintenanceFixture>) {
   );
 }
 
-it("refuses expired maintenance at cold finalizer admission before validation", async () => {
+it("rechecks maintenance lifetime after cold finalizer admission", async () => {
   const f = maintenanceFixture();
   const plan = maintenancePlan(f);
   const probe = observeWorkerAdmission(f.databasePath, true);
@@ -934,8 +937,8 @@ it("refuses expired maintenance at cold finalizer admission before validation", 
   current = false;
   probe.release.resolve();
   await expect(work).resolves.toMatchObject({ capped: 0, archivedTranscripts: [] });
-  // Expired authority refuses the preliminary admission before native integrity work.
-  await probe.expectHealthy(0);
+  // The transcript postcondition reopens a writable reader and may validate on the caller.
+  await probe.expectHealthy(1);
   expect(loadSessionEntryReadOnly(f.stale)?.sessionId).toBe("old");
   expect(loadTranscriptEventsSync(f.stale)).toEqual(f.events);
 });
