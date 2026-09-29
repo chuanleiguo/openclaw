@@ -917,7 +917,7 @@ function maintenancePlan(f: ReturnType<typeof maintenanceFixture>) {
   );
 }
 
-it("rechecks maintenance lifetime after cold finalizer admission", async () => {
+it("refuses expired maintenance at cold finalizer admission before validation", async () => {
   const f = maintenanceFixture();
   const plan = maintenancePlan(f);
   const probe = observeWorkerAdmission(f.databasePath, true);
@@ -934,8 +934,8 @@ it("rechecks maintenance lifetime after cold finalizer admission", async () => {
   current = false;
   probe.release.resolve();
   await expect(work).resolves.toMatchObject({ capped: 0, archivedTranscripts: [] });
-  // The transcript postcondition reopens a writable reader and may validate on the caller.
-  await probe.expectHealthy(1);
+  // Expired authority refuses the preliminary admission before native integrity work.
+  await probe.expectHealthy(0);
   expect(loadSessionEntryReadOnly(f.stale)?.sessionId).toBe("old");
   expect(loadTranscriptEventsSync(f.stale)).toEqual(f.events);
 });
