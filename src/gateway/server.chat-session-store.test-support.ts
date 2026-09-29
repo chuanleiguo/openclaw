@@ -103,6 +103,24 @@ export function createMainChatSessionStoreFixture(settleGatewayFixture: () => Pr
   };
 }
 
+export async function replaceMainChatTranscriptMessages(
+  messages: Record<string, unknown>[],
+): Promise<void> {
+  const storePath = testState.sessionStorePath;
+  if (!storePath) {
+    throw new Error("session store path was not initialized");
+  }
+  const events = messages.map((message, index) => ({
+    message,
+    id: `message-${index}`,
+    type: "message",
+  }));
+  await replaceTranscriptEvents(
+    { agentId: "main", sessionId: "sess-main", sessionKey: "main", storePath },
+    events,
+  );
+}
+
 export async function writeMainChatSessionTranscript(
   events: unknown[],
   sessionId = "sess-main",

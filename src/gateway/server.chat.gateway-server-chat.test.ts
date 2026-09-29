@@ -37,7 +37,10 @@ import { drainOpenClawAgentWriteQueuesForTest } from "../state/openclaw-agent-wr
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 import { observeGatewayRunExecution } from "./agent-command.test-helpers.js";
 import { flushPendingSessionsChangedEvents } from "./server-methods/session-change-event.js";
-import { createMainChatSessionStoreFixture } from "./server.chat-session-store.test-support.js";
+import {
+  createMainChatSessionStoreFixture,
+  replaceMainChatTranscriptMessages,
+} from "./server.chat-session-store.test-support.js";
 import {
   collectHistoryTextValues,
   createGatewayHistoryText,
@@ -133,7 +136,7 @@ describe("gateway server chat", () => {
     messages: Array<Record<string, unknown>>,
   ): Promise<unknown[]> => {
     return withMainSessionStore(async () => {
-      await replaceMainTranscriptMessages(messages);
+      await replaceMainChatTranscriptMessages(messages);
 
       const res = await rpcReq<{ messages?: unknown[] }>(ws, "chat.history", {
         sessionKey: "main",
@@ -141,24 +144,6 @@ describe("gateway server chat", () => {
       expect(res.ok).toBe(true);
       return res.payload?.messages ?? [];
     });
-  };
-
-  const replaceMainTranscriptMessages = async (
-    messages: Record<string, unknown>[],
-  ): Promise<void> => {
-    const storePath = testState.sessionStorePath;
-    if (!storePath) {
-      throw new Error("session store path was not initialized");
-    }
-    const events = messages.map((message, index) => ({
-      message,
-      id: `message-${index}`,
-      type: "message",
-    }));
-    await replaceTranscriptEvents(
-      { agentId: "main", sessionId: "sess-main", sessionKey: "main", storePath },
-      events,
-    );
   };
 
   const mainSessionStore = createMainChatSessionStoreFixture(settleGatewayFixture);
@@ -976,7 +961,7 @@ describe("gateway server chat", () => {
         },
       });
 
-      await replaceMainTranscriptMessages(
+      await replaceMainChatTranscriptMessages(
         Array.from({ length: 201 }, (_, i) => ({
           role: "user",
           content: [{ type: "text", text: `m${i}` }],
@@ -1511,7 +1496,7 @@ describe("gateway server chat", () => {
 
   test("routes /btw replies through side-result events without transcript injection", async () => {
     await withMainSessionStore(async () => {
-      await replaceMainTranscriptMessages([
+      await replaceMainChatTranscriptMessages([
         createGatewayHistoryText("user", "main thread context", Date.now()),
       ]);
       mockDispatchedReplies("final", [{ text: "323", btw: { question: "what is 17 * 19?" } }]);
