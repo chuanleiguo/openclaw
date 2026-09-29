@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { Worker } from "node:worker_threads";
+import { MessagePort, type Worker } from "node:worker_threads";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 import {
@@ -400,6 +400,20 @@ it.each([
       invalidateRegisteredAgentDatabasesMemo({ path: registryPath });
       let started = false;
       let finished = false;
+      // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply preserves the sending port below.
+      const post = MessagePort.prototype.postMessage;
+      const retainedDispatch = vi
+        .spyOn(MessagePort.prototype, "postMessage")
+        .mockImplementation(function (
+          this: MessagePort,
+          ...args: Parameters<MessagePort["postMessage"]>
+        ) {
+          const envelope = asOptionalRecord(args[0]);
+          if (envelope?.type === "post") {
+            observed.dispatch?.(envelope.value);
+          }
+          return Reflect.apply(post, this, args);
+        });
       observed.dispatch = (message) => {
         const input = asOptionalRecord(asOptionalRecord(message)?.input);
         const params = asOptionalRecord(asOptionalRecord(input?.request)?.params);
@@ -432,6 +446,7 @@ it.each([
         expect(started && finished).toBe(true);
       } finally {
         observed.dispatch = undefined;
+        retainedDispatch.mockRestore();
         registration.finish();
       }
     });

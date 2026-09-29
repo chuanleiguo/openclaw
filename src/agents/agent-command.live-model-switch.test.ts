@@ -397,14 +397,12 @@ vi.mock("./agent-runtime-config.js", () => {
 });
 
 vi.mock("../plugins/plugin-metadata-snapshot.js", async (importOriginal) => {
-  const { rebasePluginMetadataSnapshotManifestRegistry } =
-    await importOriginal<typeof import("../plugins/plugin-metadata-snapshot.js")>();
-  return {
-    isPluginMetadataSnapshotCompatible: () => false,
-    rebasePluginMetadataSnapshotManifestRegistry,
-    resolvePluginMetadataSnapshot: (...args: unknown[]) =>
-      state.resolvePluginMetadataSnapshotMock(...args),
-  };
+  const { createTestPluginMetadataSnapshot } =
+    await import("./agent-command.live-model-switch.test-mocks.js");
+  return createTestPluginMetadataSnapshot(
+    await importOriginal<typeof import("../plugins/plugin-metadata-snapshot.js")>(),
+    state.resolvePluginMetadataSnapshotMock,
+  );
 });
 
 vi.mock("../skills/discovery/chat-commands.runtime.js", () => ({

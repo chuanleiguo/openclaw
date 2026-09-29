@@ -103,3 +103,19 @@ export function createTestRuntimePlugins(
     },
   };
 }
+
+export function createTestPluginMetadataSnapshot(
+  native: Pick<
+    typeof import("../plugins/plugin-metadata-snapshot.js"),
+    "rebasePluginMetadataSnapshotManifestRegistry"
+  >,
+  resolve: (...args: unknown[]) => unknown,
+) {
+  return {
+    isPluginMetadataSnapshotCompatible: () => false,
+    rebasePluginMetadataSnapshotManifestRegistry:
+      native.rebasePluginMetadataSnapshotManifestRegistry,
+    resolvePluginMetadataSnapshot: resolve,
+    resolvePluginMetadataSnapshotAsync: async (...args: unknown[]) => resolve(...args),
+  };
+}

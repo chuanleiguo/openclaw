@@ -1,7 +1,16 @@
 import { expect, it, vi } from "vitest";
+import * as workerAdmission from "../../../infra/sqlite-worker-operation-admission.js";
+import { captureOpenClawStateWorkerContext } from "../../../state/openclaw-state-worker-context.js";
+import {
+  createAdmittedRunOperatorAuthority,
+  prepareSystemAgentRunAdmission,
+} from "../../admitted-run-context.js";
+import type { EmbeddedAgentRunResult } from "../../embedded-agent-runner/types.js";
+import { settleRequesterRun } from "../../requester-run-settlement.js";
 import { createSubagentRunParams } from "../../subagent-test-fixtures.test-helpers.js";
 import { createSessionsYieldTool } from "../../tools/sessions-yield-tool.js";
 import { maybeWakeRequesterAfterAllChildrenSettled } from "../announce/subagent-announce.requester-settle-wake.js";
+import { readFullSubagentRuns } from "./subagent-registry-read-cache.js";
 import type { GatewayRequest } from "./subagent-registry.lifecycle-fixture.test-support.js";
 import * as registry from "./subagent-registry.test-helpers.js";
 
@@ -26,6 +35,114 @@ export function registerRequesterWakeSettlementBoundaryTests({
   getRequesterWakeCalls: () => GatewayRequest[];
   useGlobalSessionScope: () => void;
 }): void {
+  it.each([false, true])(
+    "commits requester children only with live operator authority (revoked at commit: %s)",
+    async (revokeAtCommit) => {
+      const requesterTurnRunId = "requester-operator-settlement";
+      const child = {
+        runId: "child-operator-settlement",
+        childSessionKey: "agent:main:subagent:operator-settlement",
+        expectsCompletionMessage: true,
+      };
+      await spawnVisibleChild({ ...child, requesterTurnRunId });
+      const yielded = await createSessionsYieldTool({
+        sessionId: "sess-main",
+        claimYield: async () =>
+          (await registry.markRequesterTurnYielded({
+            requesterSessionKey,
+            requesterAgentId: "main",
+            requesterTurnRunId,
+          })) > 0,
+        onYield: () => {},
+      }).execute("yield-operator-settlement", {});
+      expect(yielded).toMatchObject({ details: { status: "yielded" } });
+      const stateContext = captureOpenClawStateWorkerContext();
+      const readPersisted = () =>
+        readFullSubagentRuns(
+          stateContext,
+          { kind: "ids", runIds: [child.runId] },
+          { current: true },
+        );
+      const before = await readPersisted();
+      expect(before.get(child.runId)?.requesterTurnRunId).toBe(requesterTurnRunId);
+      let operatorActive = true;
+      const assertSourceCurrent = vi.fn();
+      const operator = createAdmittedRunOperatorAuthority({
+        profileId: "requester-settlement-test",
+        scopes: ["operator.read"],
+        assertCurrent: () => {
+          if (!operatorActive) {
+            throw new Error("operator revoked at worker commit");
+          }
+        },
+      });
+      const admission = prepareSystemAgentRunAdmission(
+        {},
+        requesterTurnRunId,
+        "main",
+        "requester-settlement-test",
+        assertSourceCurrent,
+        operator,
+      );
+      const result: EmbeddedAgentRunResult = {
+        acceptedSessionSpawns: [child],
+        meta: { durationMs: 0, yielded: true },
+      };
+      const createAdmission = workerAdmission.createSqliteWorkerOperationAdmission;
+      let reachedCommit = false;
+      const observer = vi
+        .spyOn(workerAdmission, "createSqliteWorkerOperationAdmission")
+        .mockImplementation((admit, attachment) =>
+          createAdmission((request, grant) => {
+            if (request.stage === "commit") {
+              reachedCommit = true;
+              operatorActive = !revokeAtCommit;
+            }
+            admit(request, grant);
+          }, attachment),
+        );
+      try {
+        const admittedRunContext = await admission.admit("embedded");
+        const settling = settleRequesterRun(
+          {
+            sessionKey: requesterSessionKey,
+            agentId: "main",
+            runId: requesterTurnRunId,
+            admittedRunContext,
+          },
+          result,
+          assertSourceCurrent,
+        );
+        if (revokeAtCommit) {
+          await expect(settling).rejects.toMatchObject({ outcome: "not-committed" });
+          expect(result.requesterContinuationSettled).toBeUndefined();
+        } else {
+          await settling;
+          expect(result.requesterContinuationSettled).toBe(true);
+        }
+        expect(reachedCommit).toBe(true);
+        expect(assertSourceCurrent).toHaveBeenCalled();
+        expect(() => assertSourceCurrent()).not.toThrow();
+      } finally {
+        observer.mockRestore();
+        admission.close();
+      }
+      const after = await readPersisted();
+      if (revokeAtCommit) {
+        expect(after).toEqual(before);
+      } else {
+        expect(after.get(child.runId)).toMatchObject({
+          requesterTurnRunId: undefined,
+          requesterSettleWake: {
+            status: "pending",
+            requesterYieldBatch: true,
+            batchRunIds: [child.runId],
+          },
+        });
+      }
+    },
+  );
+
   it("delivers a yielded result despite an older failed grandchild awaiting cleanup", async () => {
     const oldTime = Date.now() - 5 * 24 * 60 * 60 * 1000;
     const oldParentKey = "agent:main:subagent:old-parent";

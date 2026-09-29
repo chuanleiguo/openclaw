@@ -379,6 +379,8 @@ vi.mock("../infra/update-managed-service-handoff-cleanup.js", async (importOrigi
 vi.mock("node:child_process", async () => {
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
   const { SQLITE_READONLY_CHILD_ARG } = await import("../infra/runtime-process-entrypoints.js");
+  const { fileURLToPath } = await import("node:url");
+  const { resolveRuntimeProcessEntrypointUrl } = await import("../infra/runtime-process-url.js");
   return {
     ...actual,
     // Async status snapshots need real SQLite IPC; updater and service children stay simulated.
@@ -391,7 +393,8 @@ vi.mock("node:child_process", async () => {
     spawn: (...args: Parameters<typeof actual.spawn>) =>
       args[0] === process.execPath &&
       Array.isArray(args[1]) &&
-      args[1].includes(SQLITE_READONLY_CHILD_ARG)
+      (args[1].includes(SQLITE_READONLY_CHILD_ARG) ||
+        args[1].at(-1) === fileURLToPath(resolveRuntimeProcessEntrypointUrl("spawnBroker")))
         ? actual.spawn(...args)
         : spawn(...args),
   };

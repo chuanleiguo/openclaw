@@ -217,6 +217,80 @@ it.each([
   expect(generationReleased).toBe(true);
 });
 
+it("retains prepared snapshot cleanup across source module reload", async () => {
+  const oldCleanup = await import("./sqlite-readonly-location-cleanup.js");
+  const oldSource = await import("./sqlite-snapshot-source.js");
+  const { captureSqliteSnapshotStagingOwner } = await import("./sqlite-snapshot-staging-owner.js");
+  const { resolveRuntimeProcessEntrypointUrl } = await import("./runtime-process-url.js");
+  const { withRuntimeWorkerGeneration } = await import("./runtime-worker-generation.js");
+  vi.stubEnv("XDG_CACHE_HOME", root);
+  const sourcePath = path.join(root, "reload-source.sqlite");
+  const source = new (requireNodeSqlite().DatabaseSync)(sourcePath);
+  try {
+    source.exec("CREATE TABLE marker(value TEXT); INSERT INTO marker VALUES('preserved');");
+  } finally {
+    source.close();
+  }
+  const sourceBytes = fs.readFileSync(sourcePath);
+  const stagingUrl = resolveRuntimeProcessEntrypointUrl("sqliteSnapshotStaging");
+  let generationReleased = false;
+  await withRuntimeWorkerGeneration(
+    async (bind) => {
+      bind((url) => {
+        if (url.href !== stagingUrl.href) {
+          return url;
+        }
+        const retained = new URL(url);
+        retained.searchParams.set("snapshot-test-generation", "prepared-source-reload");
+        return retained;
+      });
+      const owner = captureSqliteSnapshotStagingOwner();
+      const prime = oldSource.startSqliteReadOnlyLocationAsync(sourcePath, {
+        preserveSourceArtifacts: true,
+        signal: new AbortController().signal,
+      });
+      try {
+        const prepared = await prime.result;
+        expect(await prepared.startCleanup().result).toBe(true);
+      } finally {
+        await prime.startClose().result;
+      }
+      vi.resetModules();
+      const currentSource = await import("./sqlite-snapshot-source.js");
+      const currentOwner = await import("./sqlite-snapshot-staging-owner.js");
+      expect(currentOwner.captureSqliteSnapshotStagingOwner()).toBe(owner);
+      const preparation = currentSource.startSqliteReadOnlyLocationAsync(sourcePath, {
+        preserveSourceArtifacts: true,
+        signal: new AbortController().signal,
+      });
+      try {
+        const prepared = await preparation.result;
+        const reader = new (requireNodeSqlite().DatabaseSync)(prepared.location, {
+          readOnly: true,
+        });
+        try {
+          expect(reader.prepare("SELECT value FROM marker").get()).toEqual({ value: "preserved" });
+        } finally {
+          reader.close();
+        }
+        expect(await prepared.startCleanup().result).toBe(true);
+        expect(fs.existsSync(prepared.location)).toBe(false);
+        expect(fs.readFileSync(sourcePath)).toEqual(sourceBytes);
+      } finally {
+        const outcome = preparation.read();
+        if (outcome.status === "fulfilled" && outcome.value.cleanupRoot) {
+          expect(await oldCleanup.removeTempDirectoryAsync(outcome.value.cleanupRoot)).toBe(true);
+        }
+        await preparation.startClose().result;
+      }
+    },
+    async () => {
+      generationReleased = true;
+    },
+  );
+  expect(generationReleased).toBe(true);
+});
+
 it("keeps synchronous and asynchronous token cleanup in separate snapshot flights", async () => {
   const source = path.join(root, "mixed-source.sqlite");
   const database = new (requireNodeSqlite().DatabaseSync)(source);

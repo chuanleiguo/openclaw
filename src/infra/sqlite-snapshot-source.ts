@@ -8,6 +8,7 @@ import { resolvePrivateSqliteSnapshotStagingRoot } from "./sqlite-private-direct
 import {
   adoptPreparedLocation,
   adoptRetainedPreparedLocation,
+  registerRetainedSnapshotTempDirectory,
   removeTempDirectory,
   removeTempDirectoryAsync,
   SqliteSnapshotCleanupError,
@@ -128,11 +129,18 @@ export function startSqliteReadOnlyLocationAsync(
                   "SQLite snapshot producer returned an allocation without its prepared location",
                 );
               }
-              prepared ??= adoptRetainedPreparedLocation(
-                outcome.value.location,
-                outcome.value.directory,
-                requireCleanup,
-              );
+              if (!prepared) {
+                // A retained staging owner can outlive this module's cleanup registry.
+                registerRetainedSnapshotTempDirectory(
+                  outcome.value.directory,
+                  staging.retainDirectory(outcome.value.directory).startRetire,
+                );
+                prepared = adoptRetainedPreparedLocation(
+                  outcome.value.location,
+                  outcome.value.directory,
+                  requireCleanup,
+                );
+              }
               if (flightSignal.aborted) {
                 if (!cleanup) {
                   cleanup = prepared.startCleanup();
