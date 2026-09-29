@@ -24,6 +24,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { buildFullReleaseCandidateBinding } from "../../scripts/full-release-candidate-contract.mjs";
 import { FULL_RELEASE_WAIT_TIMEOUT_MINUTES } from "../../scripts/full-release-validation-at-sha.mts";
+import { resolveRunnerMatrix } from "../../scripts/lib/cross-os-release-checks/config.ts";
 import { runManagedCommand } from "../../scripts/lib/managed-child-process.mts";
 import { listRecordedFirstHopSourceVersions } from "../../scripts/lib/update-first-hop-lanes.mjs";
 import { parseUpgradeSurvivorScenarios } from "../../scripts/lib/upgrade-survivor-policy.mjs";
@@ -2992,6 +2993,15 @@ function evaluatedJobTimeouts(path: string, jobName: string, job: WorkflowJob): 
   const timeout = job["timeout-minutes"];
   if (typeof timeout === "number") {
     return [timeout];
+  }
+  if (path === CROSS_OS_RELEASE_CHECKS_REUSABLE_WORKFLOW && jobName === "cross_os_release_checks") {
+    return resolveRunnerMatrix({ mode: "both", ref: "main" }).include.map((matrix) => {
+      const minutes: unknown = evaluateWorkflowRunner(timeout, { matrix });
+      if (typeof minutes !== "number") {
+        throw new Error(`Invalid cross-OS timeout for ${matrix.os_id}:${matrix.suite}`);
+      }
+      return minutes;
+    });
   }
   if (timeout?.includes("inputs.release_")) {
     return (["beta", "stable", "full"] as const).map((profile) =>
@@ -15316,7 +15326,15 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
     expect(installSmoke.jobs?.bun_global_install_smoke?.["timeout-minutes"]).toBe(60);
     expect(installSmoke.jobs?.["docker-e2e-fast"]?.["timeout-minutes"]).toBe(12);
     expect(crossOs.jobs?.prepare?.["timeout-minutes"]).toBe(90);
-    expect(crossOs.jobs?.cross_os_release_checks?.["timeout-minutes"]).toBe(60);
+    expect(
+      Math.max(
+        ...evaluatedJobTimeouts(
+          CROSS_OS_RELEASE_CHECKS_REUSABLE_WORKFLOW,
+          "cross_os_release_checks",
+          workflowJob(CROSS_OS_RELEASE_CHECKS_REUSABLE_WORKFLOW, "cross_os_release_checks"),
+        ),
+      ),
+    ).toBe(180);
     expect(qaLive.jobs?.authorize_actor?.["timeout-minutes"]).toBe(10);
     expect(qaLive.jobs?.validate_selected_ref?.["timeout-minutes"]).toBe(30);
     expect(liveE2e.jobs?.validate_selected_ref?.["timeout-minutes"]).toBe(30);
@@ -15481,10 +15499,16 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
       timeoutForProfile(releaseChecks.jobs?.resolve_target?.["timeout-minutes"], "stable"),
       timeoutForProfile(releaseChecks.jobs?.prepare_release_package?.["timeout-minutes"], "stable"),
       timeoutForProfile(crossOs.jobs?.prepare?.["timeout-minutes"], "stable"),
-      timeoutForProfile(crossOs.jobs?.cross_os_release_checks?.["timeout-minutes"], "stable"),
+      Math.max(
+        ...evaluatedJobTimeouts(
+          CROSS_OS_RELEASE_CHECKS_REUSABLE_WORKFLOW,
+          "cross_os_release_checks",
+          workflowJob(CROSS_OS_RELEASE_CHECKS_REUSABLE_WORKFLOW, "cross_os_release_checks"),
+        ),
+      ),
       timeoutForProfile(releaseChecks.jobs?.summary?.["timeout-minutes"], "stable"),
     ];
-    expect(releaseCrossOsPath).toEqual([30, 15, 90, 60, 5]);
+    expect(releaseCrossOsPath).toEqual([30, 15, 90, 180, 5]);
 
     const releaseInstall = workflowJob(RELEASE_CHECKS_WORKFLOW, "install_smoke_release_checks");
     expect(jobNeeds(releaseInstall)).toEqual(["resolve_target"]);
