@@ -729,18 +729,19 @@ describe("worker placement startup recovery authority", () => {
       }),
     ).rejects.toThrow("placement changed");
 
+    const recoverReplacedSession = vi.fn(async () => {});
+    // Keep the replacement installed through preparation and the final authority check.
     await moveDestinationMocks.resolveCanonicalSession.withImplementation(
       () => ({
         sessionId: "session-replaced",
         worktree: { id: "worktree-recovery" },
       }),
       async () => {
-        const run = vi.fn(async () => {});
-        await expect(dispatchOptions.runRecoveryBarrier({ ...request, run })).rejects.toThrow(
-          "changed before cloud worker recovery",
-        );
-        expect(run).not.toHaveBeenCalled();
+        await expect(
+          dispatchOptions.runRecoveryBarrier({ ...request, run: recoverReplacedSession }),
+        ).rejects.toThrow("changed before cloud worker recovery");
       },
     );
+    expect(recoverReplacedSession).not.toHaveBeenCalled();
   });
 });

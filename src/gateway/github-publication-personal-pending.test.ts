@@ -118,10 +118,11 @@ it("rechecks a terminal receipt when confirming an older pending read", async ()
   insertRepositoryGitHubPublication(row, fixture.action.assertCurrent);
   const captured = expectDefined(
     await fixture.coordinator.personalPending(fixture.action, fixture.action),
-    "captured pending receipt",
+    "original pending receipt",
   );
   expect(captured.result.status).toBe("needs_confirmation");
-  const confirmation = expectDefined(captured.confirmation, "captured confirmation");
+  const confirmation = expectDefined(captured.confirmation, "original confirmation");
+  const commandCount = commands.length;
   const entered = createDeferredCore();
   const release = createDeferredCore();
   const read = repositoryStore.readPendingRepositoryGitHubPublication;
@@ -153,11 +154,13 @@ it("rechecks a terminal receipt when confirming an older pending read", async ()
       nextAction: "Create a new publication request.",
     });
     release.resolve();
-    expect(await pending).toMatchObject({
-      result: { requestId: row.request_id, status: "failed", code: "unavailable" },
-      confirmation: null,
+    const observed = expectDefined(await pending, "current publication receipt");
+    expect(observed.result).toMatchObject({
+      requestId: row.request_id,
+      status: "failed",
+      code: "unavailable",
     });
-    const commandCount = commands.length;
+    expect(observed.confirmation).toBeNull();
     await expect(
       fixture.coordinator.confirmPersonal(
         {
