@@ -1,7 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createReplyTurnParticipants } from "../../auto-reply/reply/reply-run-registry.tool-authority.js";
 import { mergeAcceptedSessionSpawnsForRun } from "../accepted-session-spawn.js";
-import { prepareSystemAgentRunAdmission } from "../admitted-run-context.js";
+import {
+  createAdmittedRunOperatorAuthority,
+  prepareSystemAgentRunAdmission,
+} from "../admitted-run-context.js";
 import { settleFailedRequesterRun, settleRequesterRun } from "../requester-run-settlement.js";
+import {
+  captureGatewayToolCallerAssertion,
+  createAdmittedGatewayToolCallerIdentity,
+  resolveGatewayToolOperatorSelection,
+  withGatewayToolCallerIdentity,
+} from "../tools/gateway-caller-context.js";
 import type { EmbeddedAgentRunResult } from "./types.js";
 
 const registry = vi.hoisted(() => ({ markYielded: vi.fn(), settle: vi.fn() }));
@@ -220,4 +230,137 @@ describe("logical requester settlement", () => {
       admission.close();
     }
   });
+  it.each([
+    ["matching", "terminal", "none"],
+    ["matching", "pending", "none"],
+    ["foreign", "terminal", "none"],
+    ["missing", "pending", "none"],
+    ["foreign", "terminal", "source"],
+    ["matching", "terminal", "operator"],
+    ["matching", "pending", "receipt"],
+    ["matching", "pending", "approval"],
+  ] as const)(
+    "fences %s requester %s handoff after %s revocation",
+    async (scope, route, revoked) => {
+      let sourceActive = true;
+      let operatorActive = true;
+      let receiptActive = true;
+      const approval = new AbortController();
+      const operator = createAdmittedRunOperatorAuthority({
+        profileId: "settlement-owner",
+        scopes: ["operator.read"],
+        assertCurrent: () => {
+          if (!operatorActive) {
+            throw new Error("operator revoked");
+          }
+        },
+      });
+      const admission = prepareSystemAgentRunAdmission(
+        {},
+        requester.runId,
+        "main",
+        "settlement-authority",
+        () => {
+          if (!sourceActive) {
+            throw new Error("source revoked");
+          }
+        },
+        operator,
+      );
+      const parent =
+        scope === "foreign"
+          ? prepareSystemAgentRunAdmission({}, "launching-parent", "main", "settlement-parent")
+          : undefined;
+      const participants = createReplyTurnParticipants({ operatorAuthority: operator });
+      const committed = vi.fn();
+      const entered = vi.fn();
+      const result = makeResult(
+        route === "pending" ? { continuationPending: true } : { yielded: true },
+      );
+      const probe = async ({ assertCurrent: assertRequester }: { assertCurrent: () => void }) => {
+        const assertCaller = captureGatewayToolCallerAssertion();
+        if (!assertCaller) {
+          throw new Error("handoff lost its caller authority");
+        }
+        assertRequester();
+        assertCaller();
+        entered();
+        await Promise.resolve();
+        if (revoked === "source") {
+          sourceActive = false;
+        }
+        if (revoked === "operator") {
+          operatorActive = false;
+        }
+        if (revoked === "receipt") {
+          receiptActive = false;
+        }
+        if (revoked === "approval") {
+          approval.abort();
+        }
+        assertRequester();
+        assertCaller();
+        committed();
+      };
+      registry.markYielded.mockImplementation(async (request) => {
+        await probe(request);
+        return 1;
+      });
+      registry.settle.mockImplementation(async (request) => {
+        await probe(request);
+        return true;
+      });
+      try {
+        const admitted = await admission.admit("embedded");
+        const caller = createAdmittedGatewayToolCallerIdentity({
+          admittedRunContext: parent ? await parent.admit("embedded") : admitted,
+          agentId: "main",
+          sessionKey: requester.sessionKey,
+          receiptAuthority: () => receiptActive,
+          approvalSignals: [approval.signal],
+        });
+        if (!caller) {
+          throw new Error("expected admitted caller");
+        }
+        await withGatewayToolCallerIdentity(
+          { ...caller, personalToolParticipants: participants, personalToolIdentityScoped: true },
+          async () => {
+            const selection = resolveGatewayToolOperatorSelection();
+            participants.close();
+            parent?.close();
+            const pending = settleRequesterRun(
+              { ...requester, ...(scope === "missing" ? {} : { preparedRunAdmission: admission }) },
+              result,
+              admission.assertSourceCurrent,
+            );
+            if (scope === "missing" || revoked !== "none") {
+              const error =
+                scope === "missing"
+                  ? "This turn has ended"
+                  : revoked === "source"
+                    ? "source revoked"
+                    : revoked === "operator"
+                      ? "operator revoked"
+                      : "agent tool caller authority is no longer active";
+              await expect(pending).rejects.toThrow(error);
+              expect(committed).not.toHaveBeenCalled();
+              expect(result.requesterContinuationSettled).toBeUndefined();
+            } else {
+              await pending;
+              expect(committed).toHaveBeenCalledOnce();
+              expect(result.requesterContinuationSettled).toBe(
+                route === "terminal" ? true : undefined,
+              );
+            }
+            expect(entered).toHaveBeenCalledTimes(scope === "missing" ? 0 : 1);
+            expect(() => selection.assertCurrent()).toThrow("This turn has ended");
+          },
+        );
+      } finally {
+        participants.close();
+        parent?.close();
+        admission.close();
+      }
+    },
+  );
 });

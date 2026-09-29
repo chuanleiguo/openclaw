@@ -4,6 +4,7 @@ import {
   hasCompletionMessageSessionSpawn,
   mergeAcceptedSessionSpawnsForRun,
 } from "./accepted-session-spawn.js";
+import { readRunOperatorAuthority } from "./admitted-run-context.js";
 import type { RunEmbeddedAgentParams } from "./embedded-agent-runner/run/params.js";
 import type { EmbeddedAgentRunResult } from "./embedded-agent-runner/types.js";
 import { recordModelFallbackStop } from "./failover-error.js";
@@ -12,6 +13,10 @@ import {
   markRequesterTurnYielded,
   settleRequesterAfterSessionSpawns,
 } from "./subagents/registry/subagent-registry.js";
+import {
+  withGatewayToolCallerIdentity,
+  withGatewayToolOperatorContinuation,
+} from "./tools/gateway-caller-context.js";
 
 // A fallback stop can also mean unrelated CLI cleanup failed. Only our failed
 // registry commit must suppress a second requester-settlement attempt.
@@ -120,7 +125,7 @@ export async function settleRequesterRun(
   ) {
     throw createSessionPlacementSettlementClosedAbortError();
   }
-  try {
+  const handoff = async () => {
     if (result.meta.continuationPending) {
       // The outbox transfers this batch only after its waiting status is delivered.
       if ((await markRequesterTurnYielded(requester)) === 0) {
@@ -138,6 +143,27 @@ export async function settleRequesterRun(
         throw new Error("accepted continuation children could not transfer terminal delivery");
       }
       result.requesterContinuationSettled = true;
+    }
+  };
+  try {
+    // Settlement belongs to this admitted run, not the tool that launched it.
+    if (instance && params.agentId) {
+      const operatorAuthority = readRunOperatorAuthority(params);
+      await withGatewayToolCallerIdentity(
+        {
+          agentId: params.agentId,
+          sessionKey: params.sessionKey,
+          operationalRunInstance: instance,
+          approvalAuthority: getActiveAgentRunDelegatedAuthority(instance),
+          operatorAuthority,
+          receiptAuthority: requester.assertCurrent,
+          approvalAuthorityCheck: requester.assertCurrent,
+          approvalSignals: params.abortSignal ? [params.abortSignal] : undefined,
+        },
+        () => withGatewayToolOperatorContinuation(operatorAuthority, handoff),
+      );
+    } else {
+      await handoff();
     }
   } catch (error) {
     if (typeof error === "object" && error !== null) {
