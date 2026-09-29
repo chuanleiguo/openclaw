@@ -518,22 +518,21 @@ export function publishSessionEntryWorkerInvalidations(
     agentId: string;
     storePath: string;
     databaseIdentity: string;
-    removedSessionKeys: readonly string[];
+    removedSessionKeys?: ReadonlySet<string>;
   },
   changedKeys: readonly string[],
   beforePublicNotifications?: () => void,
 ): void {
   const keys = [...new Set(changedKeys)];
-  const removed = new Set(params.removedSessionKeys);
   const changes: SessionRowChange[] = [];
   for (const sessionKey of keys) {
-    // Confirmed removals revoke retained generations; other changes invalidate unknown postimages.
+    // Confirmed absence revokes a generation; other incomplete postimages remain unavailable.
     publishRetainedSessionEntryChange(
       params.databaseIdentity,
       sessionKey,
       undefined,
       undefined,
-      removed.has(sessionKey),
+      params.removedSessionKeys?.has(sessionKey) === true,
     );
     const change: SessionRowChange = {
       agentId: params.agentId,
