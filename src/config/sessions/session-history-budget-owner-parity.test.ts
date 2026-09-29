@@ -25,11 +25,8 @@ import {
   resolveOpenClawAgentSqlitePath,
   runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
-import {
-  closeOpenClawStateDatabaseAsync,
-  closeOpenClawStateDatabaseForTest,
-} from "../../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
+import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
 import {
   createOpenClawTestState,
   type OpenClawTestState,
@@ -67,8 +64,7 @@ afterEach(async () => {
       closeOpenClawAgentDatabasesForTest(state.root);
     }
   } finally {
-    await closeOpenClawStateDatabaseAsync();
-    closeOpenClawStateDatabaseForTest();
+    await closeStateDatabaseForTest();
     workerChannel.unsubscribe(recordWorker);
     // Real archive/reclamation calls settle their workers. Only this test's idle
     // measurement pool remains; join termination before removing the fixture.

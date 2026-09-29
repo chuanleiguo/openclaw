@@ -12,7 +12,7 @@ import {
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { normalizeSessionDeliveryState } from "../../utils/delivery-context.shared.js";
 import type { OpenClawConfig } from "../types.openclaw.js";
-import type { CleanupDeleteFault } from "./cleanup-service.worker-fault.test-support.js";
+import { setCleanupDeleteFault } from "./cleanup-service.delete-fault.test-support.js";
 import { resolveSessionWorkStartError } from "./lifecycle.js";
 
 const cleanupRace = vi.hoisted(() => ({
@@ -20,15 +20,14 @@ const cleanupRace = vi.hoisted(() => ({
   postCommitFailureStorePath: undefined as string | undefined,
 }));
 
-const deleteFault = vi.hoisted(() => ({ value: undefined as CleanupDeleteFault | undefined }));
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:worker_threads")>();
-  const { withCleanupDeleteFault } = await import("./cleanup-service.worker-fault.test-support.js");
+  const { withCleanupDeleteFault } = await import("./cleanup-service.delete-fault.test-support.js");
   return {
     ...actual,
     Worker: class extends actual.Worker {
       constructor(filename: string | URL, options?: WorkerOptions) {
-        super(filename, withCleanupDeleteFault(options, deleteFault.value));
+        super(filename, withCleanupDeleteFault(options));
       }
     },
   };
@@ -71,7 +70,7 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 describe("sessions cleanup applied summary", () => {
   afterEach(async () => {
-    deleteFault.value = undefined;
+    setCleanupDeleteFault(undefined);
     cleanupRace.afterPreview = undefined;
     cleanupRace.postCommitFailureStorePath = undefined;
     await closeOpenClawAgentDatabasesAsync();
@@ -414,13 +413,13 @@ describe("sessions cleanup applied summary", () => {
       };
       const stores = [main, failing];
       if (!lifecycleCommitted) {
-        deleteFault.value = {
+        setCleanupDeleteFault({
           databasePath: resolveSqliteTargetFromSessionStorePath(failing.storePath, {
             agentId: failing.agentId,
-          }).path,
+          }).path!,
           sessionId: failing.sessionId,
           message: "injected second-store lifecycle failure",
-        };
+        });
       }
       for (const store of stores) {
         await replaceSessionEntry(store, {

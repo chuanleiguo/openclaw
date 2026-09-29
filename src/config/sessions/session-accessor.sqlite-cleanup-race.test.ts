@@ -318,8 +318,11 @@ describe("SQLite lifecycle cleanup races", () => {
       if (++materializations !== 1) {
         return;
       }
-      const entry = { sessionId: target.sessionId, label: "changed", updatedAt: 2 };
-      replaceSessionEntrySync(target, entry);
+      replaceSessionEntrySync(target, {
+        ...loadSessionEntry(target)!,
+        label: "changed",
+        updatedAt: 2,
+      });
     };
     const result = await applySessionEntryLifecycleMutation({
       storePath,

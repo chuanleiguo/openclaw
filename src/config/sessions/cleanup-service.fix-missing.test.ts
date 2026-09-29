@@ -11,8 +11,8 @@ import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import type { OpenClawConfig } from "../types.openclaw.js";
 import { readSessionArchiveContentSync } from "./archive-compression.js";
 import { isRetainedSessionTranscriptArchiveName } from "./artifacts.js";
+import { setCleanupDeleteFault } from "./cleanup-service.delete-fault.test-support.js";
 import { runSessionsCleanup } from "./cleanup-service.js";
-import type { CleanupDeleteFault } from "./cleanup-service.worker-fault.test-support.js";
 import {
   appendTranscriptEventSync,
   appendTranscriptMessageSync,
@@ -24,21 +24,20 @@ import {
 import { prunePublishedSessionArchivesByRetention } from "./session-accessor.sqlite-archive-store.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-
-const deleteFault = vi.hoisted(() => ({ value: undefined as CleanupDeleteFault | undefined }));
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:worker_threads")>();
-  const { withCleanupDeleteFault } = await import("./cleanup-service.worker-fault.test-support.js");
+  const { withCleanupDeleteFault } = await import("./cleanup-service.delete-fault.test-support.js");
   return {
     ...actual,
     Worker: class extends actual.Worker {
       constructor(filename: string | URL, options?: WorkerOptions) {
-        super(filename, withCleanupDeleteFault(options, deleteFault.value));
+        super(filename, withCleanupDeleteFault(options));
       }
     },
   };
 });
+
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 function listDeletedArchives(directory: string): string[] {
   if (!fs.existsSync(directory)) {
@@ -59,7 +58,7 @@ describe("sessions cleanup --fix-missing", () => {
   });
 
   afterEach(() => {
-    deleteFault.value = undefined;
+    setCleanupDeleteFault(undefined);
     closeOpenClawAgentDatabasesForTest();
   });
 
@@ -295,11 +294,11 @@ describe("sessions cleanup --fix-missing", () => {
     if (!sqlitePath) {
       throw new Error("expected SQLite session store");
     }
-    deleteFault.value = {
+    setCleanupDeleteFault({
       databasePath: sqlitePath,
       sessionId,
       message: "injected lifecycle delete failure",
-    };
+    });
     await replaceSessionEntry(scope, { sessionId, updatedAt: Date.now() });
     appendTranscriptEventSync(scope, { type: "proof", content: "must remain live" });
     const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath });
