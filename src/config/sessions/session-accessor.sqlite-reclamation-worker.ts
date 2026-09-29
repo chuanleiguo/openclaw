@@ -16,6 +16,7 @@ import type { OpenClawAgentDatabaseClaim } from "../../state/openclaw-agent-db-i
 import type { OpenClawAgentDatabaseWorkerLeaseReceipt } from "../../state/openclaw-agent-db-lease.js";
 import { registerOpenClawAgentDatabaseAsyncResource } from "../../state/openclaw-agent-db-lifecycle.js";
 import { cleanupRetiredAgentDatabaseLease } from "../../state/openclaw-agent-execution-cleanup.js";
+import type { AgentDatabaseExecutionFileIdentity } from "../../state/openclaw-agent-execution-contract.js";
 import { runOpenClawAgentWorkerWrite } from "../../state/openclaw-agent-write-admission.js";
 import {
   publishOpenClawStateDatabaseWorkerAdmission,
@@ -71,7 +72,12 @@ import {
 } from "./session-accessor.sqlite-worker-transport.js";
 
 type DatabaseOptions = SqliteSessionReclamationPlan["databaseOptions"];
-export type SqliteReclamationClaim = Pick<OpenClawAgentDatabaseClaim, "identity" | "assertCurrent">;
+export type SqliteReclamationClaim = Pick<
+  OpenClawAgentDatabaseClaim,
+  "identity" | "assertCurrent"
+> & {
+  expectedIdentity?: AgentDatabaseExecutionFileIdentity;
+};
 type SqliteMutationWorkerRequest =
   | SqliteReclamationWorkerRequest
   | SqliteCanonicalValidationWorkerRequest;
@@ -352,6 +358,9 @@ export class SqliteReclamationWorker {
       request: (operationId, coordination) => ({
         type: "reclaim",
         operationId,
+        ...(params.claim.expectedIdentity
+          ? { expectedIdentity: params.claim.expectedIdentity }
+          : {}),
         commitGate: params.commitGate,
         plan: params.plan,
         coordination,

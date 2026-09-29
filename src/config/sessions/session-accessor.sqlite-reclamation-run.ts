@@ -1,5 +1,6 @@
 import { isMainThread } from "node:worker_threads";
 import { runWithSqliteBusyTimeout } from "../../infra/sqlite-busy-timeout.js";
+import { readDatabasePathIdentitySync } from "../../infra/sqlite-worker-identity.js";
 import { getChildLogger } from "../../logging/logger.js";
 import { readOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db-identity.js";
 import { retainOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
@@ -42,7 +43,6 @@ import {
   reclaimSqliteSessionInTransaction,
   resolveSessionReclamationDatabaseOptions,
 } from "./session-accessor.sqlite-reclamation.js";
-import { withSessionEntryWorker } from "./session-accessor.sqlite-replacement-worker.js";
 import {
   runExclusiveSqliteSessionWrite,
   toDatabaseOptions,
@@ -220,25 +220,31 @@ export async function runSqliteSessionReclamation(params: {
           claim.release();
         }
       }
-      const execution = captureOpenClawAgentDatabaseExecution(params.plan.databaseOptions);
+      const file = readDatabasePathIdentitySync(params.plan.databaseOptions.path);
+      if (!file.key.startsWith("file:")) {
+        throw new Error("SQLite session reclamation lost its prepared database");
+      }
+      const expectedIdentity = {
+        kind: "file" as const,
+        physicalIdentity: file.key.slice("file:".length),
+        nativeLocation: file.canonicalPath,
+        birthtime: file.birthtime,
+      };
+      const execution = captureOpenClawAgentDatabaseExecution(params.plan.databaseOptions, {
+        expectedIdentity,
+      });
       try {
-        // Existing-only native admission supplies the same authority without a cold host handle.
-        const admitted = await withSessionEntryWorker(
-          params.plan.databaseOptions,
-          undefined,
-          assertRequestCurrent,
-          (owner, source) => owner.runExisting(source, async () => true),
-          undefined,
-          execution,
-          signal,
-        );
-        const identity = execution.fileIdentity;
-        if (!admitted || !identity) {
-          throw new Error("SQLite session reclamation lost its prepared database");
-        }
-        const claim = execution.captureGenerationClaim();
-        return await runWorker(claim, identity.nativeLocation, {
-          source: { agentId: execution.agentId, path: identity.nativeLocation },
+        // Reclamation owns cold validation outside the foreground writer permit.
+        const claim = {
+          identity: expectedIdentity.physicalIdentity,
+          expectedIdentity,
+          assertCurrent() {
+            execution.assertCurrent();
+            assertRequestCurrent();
+          },
+        } satisfies SqliteReclamationClaim;
+        return await runWorker(claim, expectedIdentity.nativeLocation, {
+          source: { agentId: execution.agentId, path: expectedIdentity.nativeLocation },
           claim,
         });
       } finally {

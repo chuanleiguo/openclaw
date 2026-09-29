@@ -97,7 +97,7 @@ export type SqliteMutationWorkerValidationOwner =
     }
   | {
       source: { agentId: string; path: string };
-      claim: AgentDatabaseGenerationClaim;
+      claim: Pick<AgentDatabaseGenerationClaim, "identity" | "assertCurrent">;
     };
 
 export type SqliteMutationWorkerMessage<Result> =

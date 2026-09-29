@@ -10,6 +10,7 @@ import { cancelWorkerIdleGc, scheduleWorkerIdleGc } from "../../infra/worker-idl
 import { recordOpenClawAgentCanonicalValidation } from "../../state/openclaw-agent-canonical-validation-receipt.js";
 import {
   createOpenClawAgentDatabaseClaim,
+  readOpenClawAgentDatabaseIdentity,
   type OpenClawAgentDatabaseClaim,
 } from "../../state/openclaw-agent-db-identity.js";
 import {
@@ -322,6 +323,16 @@ export async function runReclamationWorkerPort(
                   throw new Error("SQLite session reclamation database owner is no longer current");
                 }
                 assertOpenClawAgentDatabaseLease(lease.leaseId, options);
+                if (request.type === "reclaim" && request.expectedIdentity) {
+                  const expected = request.expectedIdentity;
+                  const actual = readOpenClawAgentDatabaseIdentity(database);
+                  if (
+                    actual.identity !== expected.physicalIdentity ||
+                    (expected.birthtime !== undefined && actual.birthtime !== expected.birthtime)
+                  ) {
+                    throw new Error("SQLite reclamation Worker opened another physical database");
+                  }
+                }
                 try {
                   // Deferred periodic work outside this synchronous page unit still needs its relay.
                   checkpointResultOwnedByRequest =
