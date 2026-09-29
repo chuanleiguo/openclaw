@@ -41,7 +41,7 @@ import {
   releaseWorkflowJobNeeds as jobNeeds,
 } from "../helpers/release-workflow-timeouts.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
-import { evaluateWorkflowRunner } from "./ci-workflow.test-support.js";
+import { evaluateWorkflowExpression, evaluateWorkflowRunner } from "./ci-workflow.test-support.js";
 
 const PACKAGE_ACCEPTANCE_WORKFLOW = ".github/workflows/package-acceptance.yml";
 const LIVE_E2E_WORKFLOW = ".github/workflows/openclaw-live-and-e2e-checks-reusable.yml";
@@ -2994,15 +2994,6 @@ function evaluatedJobTimeouts(path: string, jobName: string, job: WorkflowJob): 
   if (typeof timeout === "number") {
     return [timeout];
   }
-  if (path === CROSS_OS_RELEASE_CHECKS_REUSABLE_WORKFLOW && jobName === "cross_os_release_checks") {
-    return resolveRunnerMatrix({ mode: "both", ref: "main" }).include.map((matrix) => {
-      const minutes: unknown = evaluateWorkflowRunner(timeout, { matrix });
-      if (typeof minutes !== "number") {
-        throw new Error(`Invalid cross-OS timeout for ${matrix.os_id}:${matrix.suite}`);
-      }
-      return minutes;
-    });
-  }
   if (timeout?.includes("inputs.release_")) {
     return (["beta", "stable", "full"] as const).map((profile) =>
       timeoutForProfile(timeout, profile),
@@ -3010,6 +3001,20 @@ function evaluatedJobTimeouts(path: string, jobName: string, job: WorkflowJob): 
   }
   if (timeout === "${{ matrix.group.timeout_minutes || 60 }}") {
     return [60, 90];
+  }
+  if (path === CROSS_OS_RELEASE_CHECKS_REUSABLE_WORKFLOW && jobName === "cross_os_release_checks") {
+    return resolveRunnerMatrix({ mode: "both", ref: "main" }).include.map((matrix) => {
+      const minutes: unknown = evaluateWorkflowExpression(timeout, {
+        eventName: "workflow_dispatch",
+        repository: "openclaw/openclaw",
+        runAttempt: 1,
+        matrix,
+      });
+      if (typeof minutes !== "number") {
+        throw new Error(`Invalid matrix timeout for ${path}:${jobName}`);
+      }
+      return minutes;
+    });
   }
   if (timeout !== "${{ matrix.timeout_minutes }}") {
     throw new Error(`Unsupported timeout for ${path}:${jobName}: ${String(timeout)}`);
@@ -15327,14 +15332,14 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
     expect(installSmoke.jobs?.["docker-e2e-fast"]?.["timeout-minutes"]).toBe(12);
     expect(crossOs.jobs?.prepare?.["timeout-minutes"]).toBe(90);
     expect(
-      Math.max(
-        ...evaluatedJobTimeouts(
+      new Set(
+        evaluatedJobTimeouts(
           CROSS_OS_RELEASE_CHECKS_REUSABLE_WORKFLOW,
           "cross_os_release_checks",
           workflowJob(CROSS_OS_RELEASE_CHECKS_REUSABLE_WORKFLOW, "cross_os_release_checks"),
         ),
       ),
-    ).toBe(180);
+    ).toEqual(new Set([60, 180]));
     expect(qaLive.jobs?.authorize_actor?.["timeout-minutes"]).toBe(10);
     expect(qaLive.jobs?.validate_selected_ref?.["timeout-minutes"]).toBe(30);
     expect(liveE2e.jobs?.validate_selected_ref?.["timeout-minutes"]).toBe(30);
