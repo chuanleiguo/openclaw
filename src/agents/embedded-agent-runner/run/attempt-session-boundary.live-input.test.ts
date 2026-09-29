@@ -120,7 +120,7 @@ describe("live pending inputs at the attempt boundary", () => {
           });
           const boundary = await prepareEmbeddedAttemptSessionBoundary({
             activeSession,
-            attempt: { prompt: "announce child result", trigger: "user" },
+            attempt: { prompt: "announce child result" },
             getUserTranscriptContexts: () => undefined,
             isRawModelRun: false,
             preparedUserTurnMessage: undefined,
@@ -191,7 +191,6 @@ describe("live pending inputs at the attempt boundary", () => {
                 activeSession: original,
                 attempt: {
                   prompt: "queued user request",
-                  trigger: "user",
                   userTurnTranscriptRecorder: recorder,
                 },
                 getUserTranscriptContexts: () => undefined,

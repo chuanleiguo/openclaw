@@ -374,7 +374,6 @@ type SessionBoundaryAttempt = Pick<
   | "prompt"
   | "skipPreparedUserTurnMessage"
   | "suppressNextUserMessagePersistence"
-  | "trigger"
   | "userTurnTranscriptRecorder"
 >;
 
@@ -415,7 +414,6 @@ export async function prepareEmbeddedAttemptSessionBoundary(input: {
         preserveLeaf:
           attempt.skipPreparedUserTurnMessage === true ||
           isMainSessionRestartRecoveryInputProvenance(attempt.inputProvenance),
-        trigger: attempt.trigger,
       });
   // Admission can persist the turn before prompt preparation intentionally omits it.
   // Prefer the recorder-owned row so orphan repair cannot detach the canonical leaf.
