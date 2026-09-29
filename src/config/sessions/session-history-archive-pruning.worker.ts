@@ -24,11 +24,18 @@ import type { SessionArchivePruningWorkerInput } from "./session-transcript-work
 export function readSessionArchivePruningInDatabase(
   database: OpenClawAgentReadOnlyDatabase,
 ): PublishedSessionTranscriptArchive | null {
+  return readPublishedSessionArchiveBatchInDatabase(database, 1)[0] ?? null;
+}
+
+export function readPublishedSessionArchiveBatchInDatabase(
+  database: OpenClawAgentReadOnlyDatabase,
+  limit: number,
+): PublishedSessionTranscriptArchive[] {
   if (!tableExists(database.db, "session_transcript_archives")) {
-    return null;
+    return [];
   }
   const db = getSessionKysely(database.db);
-  const row = executeSqliteQuerySync(
+  const rows = executeSqliteQuerySync(
     database.db,
     db
       .selectFrom("session_transcript_archives")
@@ -47,14 +54,16 @@ export function readSessionArchivePruningInDatabase(
       .orderBy("created_at", "asc")
       .orderBy("session_id", "asc")
       .orderBy("generation", "asc")
-      .limit(1),
-  ).rows[0];
-  return row && row.published_at !== null ? { ...row, published_at: row.published_at } : null;
+      .limit(limit),
+  ).rows;
+  return rows.flatMap((row) =>
+    row.published_at === null ? [] : [{ ...row, published_at: row.published_at }],
+  );
 }
 
 export function readSessionArchivePruningInWorker(
   request: SessionArchivePruningWorkerInput,
-): PublishedSessionTranscriptArchive | null {
+): PublishedSessionTranscriptArchive[] {
   const identity = `file:${request.expectedIdentity.physicalIdentity}`;
   assertExistingDatabaseIdentity(request.database.path, identity);
   const result = withOpenClawAgentDatabaseReadOnly(
@@ -66,7 +75,7 @@ export function readSessionArchivePruningInWorker(
       ) {
         throw new Error("SQLite archive pruning database owner changed");
       }
-      const value = readSessionArchivePruningInDatabase(database);
+      const value = readPublishedSessionArchiveBatchInDatabase(database, request.limit ?? 1);
       assertExistingDatabaseIdentity(request.database.path, identity);
       return value;
     },

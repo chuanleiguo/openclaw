@@ -16,6 +16,7 @@ import {
 } from "../../plugins/registry-lifecycle.js";
 import { withPluginRuntimeRegistryScope } from "../../plugins/runtime/gateway-request-scope.js";
 import { createPluginRecord } from "../../plugins/status.test-helpers.js";
+import { closeMaintenanceAgentDatabase } from "../../state/openclaw-agent-db-lifecycle.js";
 import { invalidateOpenClawAgentDatabaseValidation } from "../../state/openclaw-agent-db-validation-cache.js";
 import {
   closeOpenClawAgentDatabaseByPath,
@@ -47,6 +48,7 @@ import {
   applySessionEntryReplacements,
   applySessionStoreProjection,
 } from "./session-accessor.sqlite-projection.js";
+import * as reclamationWorker from "./session-accessor.sqlite-reclamation-worker.js";
 import {
   resolveSqliteScope,
   resolveSqliteTranscriptArchiveDirectory,
@@ -632,7 +634,33 @@ it("reacquires post-builder references before planning lifecycle transcript dele
 it("reacquires the split lifecycle commit after real archive materialization", async () => {
   const f = fixture();
   const transcript = seedTranscript(f);
-  const probe = observeAdmission(f.databasePath, true);
+  const probe = observeWorkerAdmission(f.databasePath, true);
+  const commitRequested = createDeferred();
+  const commitRelease = createDeferred();
+  releases.push(() => commitRelease.resolve());
+  let closePlanningWorker: (() => Promise<void>) | undefined;
+  // oxlint-disable-next-line typescript/unbound-method -- Pass-through spy invokes the method with its original Worker receiver via call below.
+  const execute = reclamationWorker.SqliteReclamationWorker.prototype.run;
+  vi.spyOn(reclamationWorker.SqliteReclamationWorker.prototype, "run").mockImplementation(function (
+    this: reclamationWorker.SqliteReclamationWorker,
+    params,
+  ) {
+    if (params.plan.kind === "lifecycle-projection-plan") {
+      closePlanningWorker = () => this.close();
+    }
+    return execute.call(
+      this,
+      params.plan.kind === "lifecycle-projection-commit"
+        ? {
+            ...params,
+            onCommitRequest: () => {
+              void own(commitRelease.promise.then(() => params.onCommitRequest()));
+              commitRequested.resolve();
+            },
+          }
+        : params,
+    );
+  });
   let materializations = 0;
   let preparationWriterRan = false;
   hooks.afterMaterialize = async () => {
@@ -644,7 +672,18 @@ it("reacquires the split lifecycle commit after real archive materialization", a
       },
       "session.transcript.batch",
     );
-    closeForIntegrityAdmission(f);
+    if (!closePlanningWorker) {
+      throw new Error("Expected the completed lifecycle planning Worker");
+    }
+    await closePlanningWorker();
+    const database = getOpenClawAgentDatabaseIfOpen(f.options);
+    if (!database) {
+      throw new Error("Expected the original host database publication");
+    }
+    // Retire native handles without revoking the deletion's live execution authority.
+    closeMaintenanceAgentDatabase(database);
+    invalidateOpenClawAgentDatabaseValidation(f.databasePath);
+    clearOpenClawAgentIntegrityVerification(f.databasePath, f.input.env);
   };
   const work = own(
     applySessionEntryLifecycleMutation({
@@ -654,6 +693,14 @@ it("reacquires the split lifecycle commit after real archive materialization", a
     }),
   );
   await probe.expectPending(work);
+  // Cold validation releases its preliminary permit; the commit reacquires the FIFO.
+  probe.release.resolve();
+  await Promise.race([
+    commitRequested.promise,
+    work.then(() => {
+      throw new Error("Lifecycle deletion completed without its commit request");
+    }),
+  ]);
   let laterRan = false;
   const later = own(
     runExclusiveSqliteSessionWrite(
@@ -668,7 +715,7 @@ it("reacquires the split lifecycle commit after real archive materialization", a
   expect(laterRan).toBe(false);
   expect(preparationWriterRan).toBe(true);
   expect(loadSessionEntryReadOnly(f.input)?.sessionId).toBe("original");
-  probe.release.resolve();
+  commitRelease.resolve();
   const result = await work;
   await later;
   expect(materializations).toBe(1);
@@ -681,7 +728,7 @@ it("reacquires the split lifecycle commit after real archive materialization", a
   ).toBe(true);
   expect(loadSessionEntryReadOnly(f.input)).toBeUndefined();
   expect(loadTranscriptEventsSync(transcript.scope)).toEqual([]);
-  probe.expectHealthy(1);
+  await probe.expectHealthy(1);
 });
 
 it.each([false, true])(

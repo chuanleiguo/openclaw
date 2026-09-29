@@ -354,53 +354,72 @@ describe("sessions cleanup --fix-missing", () => {
     expect(listDeletedArchives(path.dirname(storePath))).toEqual([]);
   });
 
-  it("drops a retained canonical row only after retention removes its derived file", async () => {
-    const sessionKey = "agent:main:retention";
-    const sessionId = "retention";
-    const scope = { sessionKey, sessionId, storePath };
-    await replaceSessionEntry(scope, { sessionId, updatedAt: Date.now() });
-    appendTranscriptEventSync(scope, { type: "proof", content: "expire together" });
-    await runSessionsCleanup({
-      cfg: {},
-      opts: { enforce: true, fixMissing: true },
-      targets: [{ agentId: "main", storePath }],
-    });
-    const archivePath = listDeletedArchives(path.dirname(storePath))[0];
-    expect(archivePath).toBeTruthy();
-    const sqlitePath = resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main" }).path;
-    if (!sqlitePath) {
-      throw new Error("expected SQLite session store");
-    }
-    const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath });
-    database.db
-      .prepare("UPDATE session_transcript_archives SET created_at = 1 WHERE session_id = ?")
-      .run(sessionId);
-
-    expect(
-      await prunePublishedSessionArchivesByRetention({
-        scope: { agentId: "main", path: sqlitePath },
-        rules: [{ reason: "deleted", olderThanMs: 10 }],
-        nowMs: 100,
-      }),
-    ).toBe(0);
-    expect(
+  it.each(["logical", "old-physical", "hash-mismatch"] as const)(
+    "retains canonical recovery until its exact derived file is removed (%s)",
+    async (layout) => {
+      const sessionKey = "agent:main:retention";
+      const sessionId = "retention";
+      const scope = { sessionKey, sessionId, storePath };
+      await replaceSessionEntry(scope, { sessionId, updatedAt: Date.now() });
+      appendTranscriptEventSync(scope, { type: "proof", content: "expire together" });
+      await runSessionsCleanup({
+        cfg: {},
+        opts: { enforce: true, fixMissing: true },
+        targets: [{ agentId: "main", storePath }],
+      });
+      const archivePath = listDeletedArchives(path.dirname(storePath))[0];
+      if (!archivePath) {
+        throw new Error("expected published archive");
+      }
+      const sqlitePath = resolveSqliteTargetFromSessionStorePath(storePath, {
+        agentId: "main",
+      }).path;
+      if (!sqlitePath) {
+        throw new Error("expected SQLite session store");
+      }
+      const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath });
       database.db
-        .prepare("SELECT 1 FROM session_transcript_archives WHERE session_id = ?")
-        .get(sessionId),
-    ).toEqual({ 1: 1 });
+        .prepare("UPDATE session_transcript_archives SET created_at = 1 WHERE session_id = ?")
+        .run(sessionId);
+      // The real writer leaves an intact export at the physical store. A distinct logical
+      // selector recreates the existing layout left by physical-path archive publication.
+      const retentionScope = {
+        agentId: "main",
+        path: sqlitePath,
+        ownerStorePath:
+          layout === "logical"
+            ? storePath
+            : path.join(path.dirname(storePath), "selected", "sessions.json"),
+      };
+      const prune = (nowMs: number) =>
+        prunePublishedSessionArchivesByRetention({
+          scope: retentionScope,
+          rules: [{ reason: "deleted", olderThanMs: 10 }],
+          nowMs,
+        });
+      const retainedRow = () =>
+        database.db
+          .prepare("SELECT 1 FROM session_transcript_archives WHERE session_id = ?")
+          .get(sessionId);
 
-    fs.rmSync(archivePath ?? "");
-    expect(
-      await prunePublishedSessionArchivesByRetention({
-        scope: { agentId: "main", path: sqlitePath },
-        rules: [{ reason: "deleted", olderThanMs: 10 }],
-        nowMs: 100,
-      }),
-    ).toBe(1);
-    expect(
-      database.db
-        .prepare("SELECT 1 FROM session_transcript_archives WHERE session_id = ?")
-        .get(sessionId),
-    ).toBeUndefined();
-  });
+      expect(await prune(1)).toBe(0);
+      expect(fs.existsSync(archivePath)).toBe(true);
+      expect(retainedRow()).toEqual({ 1: 1 });
+      if (layout === "hash-mismatch") {
+        fs.appendFileSync(archivePath, "synthetic changed bytes");
+        await expect(prune(100)).rejects.toThrow("hash verification");
+        expect(fs.existsSync(archivePath)).toBe(true);
+        expect(retainedRow()).toEqual({ 1: 1 });
+        return;
+      }
+      if (layout === "logical") {
+        expect(await prune(100)).toBe(0);
+        expect(retainedRow()).toEqual({ 1: 1 });
+        fs.rmSync(archivePath);
+      }
+      expect(await prune(100)).toBe(1);
+      expect(fs.existsSync(archivePath)).toBe(false);
+      expect(retainedRow()).toBeUndefined();
+    },
+  );
 });

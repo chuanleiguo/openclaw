@@ -443,6 +443,7 @@ type SessionArchivePresenceWorkerInput = TranscriptArchivePresenceRead & {
 
 export type SessionArchivePruningWorkerInput = {
   kind: "session-archive-pruning";
+  limit?: number;
   database: { agentId: string; path: string };
   env: NodeJS.ProcessEnv;
   expectedIdentity: AgentDatabaseExecutionFileIdentity;
@@ -512,7 +513,7 @@ export type SessionTranscriptWorkerValues = {
   };
   "session-archive-pruning": {
     kind: "session-archive-pruning";
-    result: PublishedSessionTranscriptArchive | null;
+    result: PublishedSessionTranscriptArchive[];
   };
   "transcript-search": { kind: "transcript-search"; result: SessionTranscriptSearchResult };
   "transcript-match": { kind: "transcript-match"; result: { event: TranscriptEvent } | undefined };
@@ -601,6 +602,9 @@ export type SessionHistoryWorkerDatabase = {
   readArchivePruning: (
     input: Omit<SessionArchivePruningWorkerInput, "kind" | "database">,
   ) => Promise<PublishedSessionTranscriptArchive | null>;
+  readArchivePruningBatch: (
+    input: Omit<SessionArchivePruningWorkerInput, "kind" | "database">,
+  ) => Promise<PublishedSessionTranscriptArchive[]>;
   readColdMetadata: (
     input: Omit<SessionColdMetadataWorkerInput, "kind" | "database">,
   ) => Promise<SessionColdMetadataWorkerResult>;

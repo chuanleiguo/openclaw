@@ -111,6 +111,7 @@ export async function withSqliteSessionPageReclamation<T>(
       // Incognito and explicit Doctor/cleanup maintenance retain their existing native owner.
       const {
         readSessionArchivePruningInDatabase,
+        readPublishedSessionArchiveBatchInDatabase,
         deletePublishedSessionArchiveInDatabase,
         removeLegacySessionArchiveInDatabase,
       } = await import("./session-history-archive-pruning.worker.js");
@@ -153,6 +154,15 @@ export async function withSqliteSessionPageReclamation<T>(
               (database) => {
                 assertNativeCurrent();
                 return readSessionArchivePruningInDatabase(database);
+              },
+              assertNativeCurrent,
+            ),
+          readPublishedBatch: async (limit) =>
+            await withSqliteSessionDatabase(
+              databaseOptions,
+              (database) => {
+                assertNativeCurrent();
+                return readPublishedSessionArchiveBatchInDatabase(database, limit);
               },
               assertNativeCurrent,
             ),
@@ -281,6 +291,16 @@ export async function withSqliteSessionPageReclamation<T>(
                 const result = await reader.readArchivePruning({
                   env: databaseOptions.env,
                   expectedIdentity,
+                });
+                assertPruningCurrent();
+                return result;
+              },
+              readPublishedBatch: async (limit) => {
+                assertPruningCurrent();
+                const result = await reader.readArchivePruningBatch({
+                  env: databaseOptions.env,
+                  expectedIdentity,
+                  limit,
                 });
                 assertPruningCurrent();
                 return result;

@@ -15,6 +15,7 @@ export type SessionLegacyArchiveRemovalResult = "removed" | "failed" | "preserve
 export type SessionArchivePruningOperations = {
   withWriter: <T>(run: () => Promise<T>) => Promise<T>;
   read: () => Promise<PublishedSessionTranscriptArchive | null>;
+  readPublishedBatch: (limit: number) => Promise<PublishedSessionTranscriptArchive[]>;
   removeLegacy: (filePath: string) => Promise<SessionLegacyArchiveRemovalResult>;
   deletePublished: (archive: PublishedSessionTranscriptArchive) => Promise<void>;
 };

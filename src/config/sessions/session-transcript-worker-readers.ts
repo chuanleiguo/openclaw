@@ -86,6 +86,12 @@ export function createSessionHistoryWorkerReaders(
       "session-archive-pruning",
       "archive pruning",
       (input) => ({ kind: "session-archive-pruning", ...input }),
+      (value) => value.result[0] ?? null,
+    ),
+    readArchivePruningBatch: reader(
+      "session-archive-pruning",
+      "archive retention",
+      (input) => ({ kind: "session-archive-pruning", ...input }),
       (value) => value.result,
     ),
     readColdMetadata: reader(
