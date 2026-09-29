@@ -729,12 +729,18 @@ describe("worker placement startup recovery authority", () => {
       }),
     ).rejects.toThrow("placement changed");
 
-    moveDestinationMocks.resolveCanonicalSession.mockReturnValueOnce({
-      sessionId: "session-replaced",
-      worktree: { id: "worktree-recovery" },
-    });
-    await expect(
-      dispatchOptions.runRecoveryBarrier({ ...request, run: async () => {} }),
-    ).rejects.toThrow("changed before cloud worker recovery");
+    await moveDestinationMocks.resolveCanonicalSession.withImplementation(
+      () => ({
+        sessionId: "session-replaced",
+        worktree: { id: "worktree-recovery" },
+      }),
+      async () => {
+        const run = vi.fn(async () => {});
+        await expect(dispatchOptions.runRecoveryBarrier({ ...request, run })).rejects.toThrow(
+          "changed before cloud worker recovery",
+        );
+        expect(run).not.toHaveBeenCalled();
+      },
+    );
   });
 });

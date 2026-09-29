@@ -109,6 +109,7 @@ function createFixture(profile?: ReturnType<typeof ensureProfileForEmail>) {
     getClientConnIds: (filter?: (candidate: GatewayClient) => boolean) =>
       new Set(connected && (!filter || filter(client)) ? [client.connId] : []),
     githubPublicationService: {
+      preparePersonalStatus: vi.fn().mockResolvedValue(undefined),
       sharedStatus,
       latestShared,
       personalStatus,

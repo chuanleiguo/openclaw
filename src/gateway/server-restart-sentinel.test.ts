@@ -1246,6 +1246,7 @@ describe("scheduleRestartSentinelWake", () => {
             }),
           }),
           subscribers,
+          { prepareSessionProjection: expect.any(Function) },
         );
         expect(mocks.enqueueDeliveryOnce).not.toHaveBeenCalled();
         if (withContinuation) {
