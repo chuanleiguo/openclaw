@@ -241,7 +241,6 @@ export async function runSqliteSessionReclamation(params: {
           expectedIdentity,
           assertCurrent() {
             execution.assertCurrent();
-            assertRequestCurrent();
           },
         } satisfies SqliteReclamationClaim;
         return await runWorker(claim, expectedIdentity.nativeLocation, {
