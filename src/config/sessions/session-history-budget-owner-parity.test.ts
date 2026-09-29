@@ -25,7 +25,10 @@ import {
   resolveOpenClawAgentSqlitePath,
   runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
-import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
+import {
+  closeOpenClawStateDatabaseAsync,
+  closeOpenClawStateDatabaseForTest,
+} from "../../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import {
   createOpenClawTestState,
@@ -64,6 +67,7 @@ afterEach(async () => {
       closeOpenClawAgentDatabasesForTest(state.root);
     }
   } finally {
+    await closeOpenClawStateDatabaseAsync();
     closeOpenClawStateDatabaseForTest();
     workerChannel.unsubscribe(recordWorker);
     // Real archive/reclamation calls settle their workers. Only this test's idle

@@ -514,20 +514,26 @@ function publishRetainedSessionEntryChange(
 
 /** A confirmed worker result invalidates row facts without opening a parent connection. */
 export function publishSessionEntryWorkerInvalidations(
-  params: { agentId: string; storePath: string; databaseIdentity: string },
+  params: {
+    agentId: string;
+    storePath: string;
+    databaseIdentity: string;
+    removedSessionKeys: readonly string[];
+  },
   changedKeys: readonly string[],
   beforePublicNotifications?: () => void,
 ): void {
   const keys = [...new Set(changedKeys)];
+  const removed = new Set(params.removedSessionKeys);
   const changes: SessionRowChange[] = [];
   for (const sessionKey of keys) {
-    // The commit is confirmed, but this result supplies no complete sharing postimage.
+    // Confirmed removals revoke retained generations; other changes invalidate unknown postimages.
     publishRetainedSessionEntryChange(
       params.databaseIdentity,
       sessionKey,
       undefined,
       undefined,
-      false,
+      removed.has(sessionKey),
     );
     const change: SessionRowChange = {
       agentId: params.agentId,
