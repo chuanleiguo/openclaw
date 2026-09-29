@@ -18,6 +18,7 @@ import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import type { SessionPendingInputs } from "../../state/openclaw-agent-db.generated.js";
 import {
   getOpenClawAgentDatabaseIfOpen,
+  resolveOpenClawAgentSqlitePath,
   runOpenClawAgentWriteTransaction,
   type OpenClawAgentDatabase,
   type OpenClawAgentDatabaseOptions,
@@ -25,7 +26,11 @@ import {
 import { hasSessionPendingInputsSchema } from "../../state/openclaw-agent-pending-inputs-schema.js";
 import type { OpenClawConfig } from "../types.openclaw.js";
 import { assertCapturedSessionEntryReadSource } from "./session-accessor.sqlite-exact-read.js";
-import { getSessionKysely, type ResolvedTranscriptScope } from "./session-accessor.sqlite-scope.js";
+import {
+  getSessionKysely,
+  toDatabaseOptions,
+  type ResolvedTranscriptScope,
+} from "./session-accessor.sqlite-scope.js";
 import type { CapturedSessionEntryReadSource } from "./session-entry-read-source.types.js";
 import { SessionPendingInputCustodyError } from "./session-pending-input-custody-error.js";
 
@@ -58,6 +63,8 @@ export type SessionPendingInputOwner = {
   assertCurrent: () => void;
   /** Published only after the exact input was consumed by a committed transcript write. */
   consumed?: true;
+  /** The committed aggregate retains its source owners until their turn finishes. */
+  promotedOwner?: SessionPendingInputOwner;
   finish: (disposition: Exclude<SessionPendingInputState, "queued">) => void;
   restartRecovered?: true;
   /** Aggregate authority is the exact source closures, never persisted source identifiers. */
@@ -154,6 +161,33 @@ function assertPendingInputOwnerCurrent(owner: SessionPendingInputOwner): void {
     );
   }
   owner.assertCurrent();
+}
+
+/** A promoted input can outlive its pending row while another turn still owns it. */
+export function hasForeignLiveSessionPendingInputOwner(
+  scope: ResolvedTranscriptScope,
+  entryId: string,
+): boolean {
+  const databasePath = resolveOpenClawAgentSqlitePath(toDatabaseOptions(scope));
+  for (const source of owners.live.values()) {
+    const owner = source.promotedOwner ?? source;
+    if (
+      owner === owners.current.getStore() ||
+      owner.databasePath !== databasePath ||
+      owner.sessionId !== scope.sessionId ||
+      owner.sessionKey !== scope.sessionKey ||
+      owner.transcriptInputId !== entryId
+    ) {
+      continue;
+    }
+    try {
+      assertPendingInputOwnerCurrent(owner);
+      return true;
+    } catch {
+      // Finished, cancelled, or superseded turns no longer protect an orphan.
+    }
+  }
+  return false;
 }
 
 export function runWithSessionPendingInput<T>(owner: SessionPendingInputOwner, run: () => T): T {
@@ -589,6 +623,9 @@ export function consumeSessionPendingInput(
     commit: () => {
       for (const consumedOwner of consumedOwners) {
         consumedOwner.consumed = true;
+        if (owner?.sources) {
+          consumedOwner.promotedOwner = owner;
+        }
       }
     },
   });

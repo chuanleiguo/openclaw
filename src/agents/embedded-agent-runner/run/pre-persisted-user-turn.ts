@@ -1,6 +1,8 @@
 import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage } from "../../../../packages/agent-core/src/types.js";
 import {
+  isSessionTranscriptEntryOwnedByAnotherPendingInput,
+  type SessionTranscriptRuntimeTarget,
   loadSessionEntry,
   loadTranscriptHeaderSync,
   type SessionTranscriptWriteScope,
@@ -26,7 +28,7 @@ import {
   sessionManagerPrepareCurrentTurnReplay,
   type CurrentTurnReplayWitness,
 } from "../../sessions/session-manager-current-turn.js";
-import type { SessionEntry } from "../../sessions/session-manager-types.js";
+import type { SessionEntry, SessionMessageEntry } from "../../sessions/session-manager-types.js";
 import type { SessionManager } from "../../sessions/session-manager.js";
 
 export type InitialUserTurnReplayPreparation = (
@@ -201,4 +203,26 @@ export function reconcilePrePersistedCurrentUserTurn(params: {
     durableTurnMatches ||
     params.currentUserTurnMessage?.excludeFromContext === true
   );
+}
+
+/** Keep another live turn durable while excluding it from this attempt, including context rebuilds. */
+export function reconcileForeignPendingUserTurn(params: {
+  activeSession: { agent: { state: { messages: AgentMessage[] } } };
+  target: SessionTranscriptRuntimeTarget | undefined;
+  entry: SessionMessageEntry & { message: PersistedUserTurnMessage };
+}): ((messages: AgentMessage[]) => AgentMessage[]) | undefined {
+  if (
+    !params.target ||
+    !isSessionTranscriptEntryOwnedByAnotherPendingInput(params.target, params.entry.id)
+  ) {
+    return undefined;
+  }
+  const key = params.entry.message.idempotencyKey;
+  const omitInput = (messages: AgentMessage[]) =>
+    messages.filter(
+      (message) =>
+        !(message.role === "user" && "idempotencyKey" in message && message.idempotencyKey === key),
+    );
+  params.activeSession.agent.state.messages = omitInput(params.activeSession.agent.state.messages);
+  return omitInput;
 }

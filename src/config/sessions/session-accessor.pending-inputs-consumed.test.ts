@@ -1,3 +1,4 @@
+import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -22,6 +23,7 @@ import {
 } from "./session-accessor.js";
 import {
   bindSessionPendingInputSources,
+  isSessionTranscriptEntryOwnedByAnotherPendingInput,
   listSessionPendingInputs,
   readSessionPendingInput,
   stageSessionPendingInput,
@@ -93,6 +95,79 @@ describe("committed pending input release", () => {
       receipt.finish("interrupted");
     }
     closeOpenClawAgentDatabasesForTest();
+  });
+
+  it.each([false, true])(
+    "scopes live transcript protection until custody ends (collected: %s)",
+    async (collected) => {
+      let current = true;
+      const source = await stage("protected-input", {
+        assertCurrent: () => {
+          if (!current) {
+            throw new Error("Synthetic admission revoked");
+          }
+        },
+      });
+      const receipt = collected
+        ? expectDefined(
+            bindSessionPendingInputSources([source], message("protected-aggregate")),
+            "Expected aggregate receipt",
+          )
+        : source;
+      const promoted = expectDefined(await promote(receipt), "Expected promoted input");
+      const protectedInput = (target = scope(), entryId = promoted.messageId) =>
+        isSessionTranscriptEntryOwnedByAnotherPendingInput(target, entryId);
+      expect(protectedInput()).toBe(true);
+      expect(
+        isSessionTranscriptEntryOwnedByAnotherPendingInput(
+          {
+            agentId: "main",
+            sessionKey: scope().sessionKey,
+            sessionId: scope().sessionId,
+            env: {
+              ...process.env,
+              OPENCLAW_STATE_DIR: path.resolve(fixture.sessionsDir(), "../../.."),
+            },
+          },
+          promoted.messageId,
+        ),
+      ).toBe(true);
+      expect(receipt.run(() => protectedInput())).toBe(false);
+      expect(protectedInput(scope(), "unrelated-entry")).toBe(false);
+      expect(protectedInput({ ...scope(), sessionId: "other-session" })).toBe(false);
+      expect(protectedInput({ ...scope(), sessionKey: "agent:main:other-key" })).toBe(false);
+      expect(() =>
+        protectedInput({
+          ...scope(),
+          agentId: "other-agent",
+          sessionKey: "agent:other-agent:consumed-release",
+        }),
+      ).toThrow("belongs to agent main");
+      expect(
+        protectedInput({
+          ...scope(),
+          storePath: path.join(fixture.sessionsDir(), "other-store", "sessions.json"),
+        }),
+      ).toBe(false);
+      current = false;
+      expect(protectedInput()).toBe(false);
+      current = true;
+      expect(protectedInput()).toBe(true);
+      receipt.finish("cancelled");
+      expect(protectedInput()).toBe(false);
+    },
+  );
+
+  it("retires promoted transcript protection on lifecycle rotation", async () => {
+    const receipt = await stage("rotated-input");
+    const promoted = expectDefined(await promote(receipt), "Expected promoted input");
+    expect(isSessionTranscriptEntryOwnedByAnotherPendingInput(scope(), promoted.messageId)).toBe(
+      true,
+    );
+    rotateAgentEventLifecycleGeneration();
+    expect(isSessionTranscriptEntryOwnedByAnotherPendingInput(scope(), promoted.messageId)).toBe(
+      false,
+    );
   });
 
   it.each([false, true])(
