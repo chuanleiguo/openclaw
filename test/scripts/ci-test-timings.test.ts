@@ -18,7 +18,6 @@ import {
   type CompactNodeTestShard,
   type NodeTestShardGroup,
   createNodeTestShardBundles,
-  createSelectedNodeTestShardBundles,
   isExclusiveCompactShardName,
 } from "../../scripts/lib/ci-node-test-plan.mts";
 import { rebalanceRuntimeTestJobs } from "../../scripts/lib/ci-runtime-test-placement.mts";
@@ -31,13 +30,11 @@ import {
 } from "../../scripts/lib/ci-test-timings-schema.mts";
 import * as testTimings from "../../scripts/lib/ci-test-timings.mts";
 import { createExtensionTestTimingKey } from "../../scripts/lib/extension-test-plan.mts";
-import * as localCheckRuntime from "../../scripts/lib/local-check-runtime.mts";
 import { createCompactSplitTimingGeneration } from "../../scripts/lib/vitest-shard-metadata.mts";
 import {
   resolveRuntimeWorkerArgv,
   resolveRuntimeWorkerUrl,
 } from "../../src/infra/runtime-worker-url.js";
-import { fullSuiteVitestShards } from "../vitest/vitest.test-shards.mjs";
 import { toolingProbeRuntimeEntrypoints } from "./tooling-probe-runtime.test-support.mts";
 
 function uiLog(files: Record<string, number>, overhead = 0.6) {
@@ -666,15 +663,82 @@ describe("runtime placement observations", () => {
 
   it.each(
     (["push", "pull-request"] as const).flatMap((compactMode) =>
-      [false, true].map((gatewayRecipient) => ({ compactMode, gatewayRecipient })),
+      [false, true].map((gatewayRecipient) => ({
+        compactMode,
+        gatewayRecipient,
+        inventory: gatewayRecipient ? "bounded Gateway" : "full",
+      })),
     ),
   )(
-    "admits complete $compactMode runtime placement without changing inventories or precise capacity (Gateway recipient: $gatewayRecipient)",
-    ({ compactMode, gatewayRecipient }) => {
+    "admits $compactMode runtime placement with $inventory inventory without changing inventories or precise capacity",
+    async ({ compactMode, gatewayRecipient }) => {
+      // The planner caches split inventories, so each inventory needs its own module instance.
+      vi.resetModules();
+      const [
+        { createNodeTestShardBundles: createBundles, createSelectedNodeTestShardBundles },
+        nodeTestInventory,
+        testFiles,
+        { databaseWorkerCoreTestFiles },
+        { fullSuiteVitestShards },
+        localCheckRuntime,
+        placementTimings,
+      ] = await Promise.all([
+        import("../../scripts/lib/ci-node-test-plan.mts"),
+        import("../../scripts/lib/ci-node-test-inventory.mts"),
+        import("../../scripts/lib/list-test-files.mts"),
+        import("../vitest/vitest.database-worker-core-paths.mjs"),
+        import("../vitest/vitest.test-shards.mjs"),
+        import("../../scripts/lib/local-check-runtime.mts"),
+        import("../../scripts/lib/ci-test-timings.mts"),
+      ]);
       const originalShards = fullSuiteVitestShards.slice();
       const runtimeConfig = "test/vitest/vitest.runtime-config.config.ts";
       const infrastructure = "test/vitest/vitest.infra.config.ts";
-      const gatewayFixtureConfig = "fixture-agentic-gateway-server-isolated.config.ts";
+      const gatewayFixtureNames = ["agentic-gateway-core-1", "agentic-gateway-core-2"];
+      const gatewayFixtureConfigs = new Set(
+        gatewayFixtureNames.map((name) => `fixture-${name}.config.ts`),
+      );
+      const fixtureConfigFiles = [
+        "src/config/state-startup-corpus.test.ts",
+        "src/config/paths.test.ts",
+      ];
+      const fixtureStorageFiles = ["src/entry.memory-json.test.ts"];
+      const fixtureInfraFiles = ["src/infra/update-managed-service-handoff-lifecycle.test.ts"];
+      const fixtureFiles = [...fixtureConfigFiles, ...fixtureStorageFiles, ...fixtureInfraFiles];
+      const originalDatabaseFiles = databaseWorkerCoreTestFiles.slice();
+      const wholeFixtureFiles: Record<string, string[]> = {
+        "core-runtime-config": fixtureConfigFiles,
+        "core-runtime-infra-storage-state": fixtureStorageFiles,
+        "core-runtime-infra-system-runtime": fixtureInfraFiles,
+      };
+      // Keep Gateway receiver capacity independent of the growing real inventory.
+      // The other cases still qualify the full production inventory.
+      const inventorySpies = gatewayRecipient
+        ? [
+            vi
+              .spyOn(testFiles, "listTrackedTestFiles")
+              .mockImplementation((root, suffix = ".test.ts") =>
+                fixtureFiles.filter(
+                  (file) => (root === "." || file.startsWith(`${root}/`)) && file.endsWith(suffix),
+                ),
+              ),
+            vi
+              .spyOn(nodeTestInventory, "listWholeConfigFiles")
+              .mockImplementation((owner) => wholeFixtureFiles[owner]),
+            vi
+              .spyOn(nodeTestInventory, "listWholeConfigSplitFiles")
+              .mockImplementation((owner) => wholeFixtureFiles[owner]),
+            vi
+              .spyOn(nodeTestInventory, "listNodeTestConfigFiles")
+              .mockImplementation((config) =>
+                config === runtimeConfig
+                  ? fixtureConfigFiles
+                  : config === infrastructure
+                    ? [...fixtureStorageFiles, ...fixtureInfraFiles]
+                    : undefined,
+              ),
+          ]
+        : [];
       const isExclusiveConfig = localCheckRuntime.isExclusiveCiTestConfig;
       // Model a Gateway recipient without borrowing a changing project inventory.
       const gatewayConfigSpy = gatewayRecipient
@@ -682,7 +746,7 @@ describe("runtime placement observations", () => {
             .spyOn(localCheckRuntime, "isExclusiveCiTestConfig")
             .mockImplementation((config) =>
               isExclusiveConfig(
-                config === gatewayFixtureConfig
+                gatewayFixtureConfigs.has(config)
                   ? "test/vitest/vitest.gateway-methods-isolated.config.ts"
                   : config,
               ),
@@ -693,25 +757,32 @@ describe("runtime placement observations", () => {
         infrastructure,
         ...(gatewayRecipient ? [] : ["test/vitest/vitest.gateway-database-workers.config.ts"]),
       ]);
-      // Keep full inventories, but make spare placement capacity independent of
-      // growing production prices. Runtime observations below supply the overload.
+      // Runtime observations supply the overload without changing initial prices
+      // or the production capacity limits.
       const compactCosts = new Proxy<Record<string, number>>(
-        { "agentic-gateway-server-isolated": 30, "agentic-agents-core-subagents": 20 },
+        { "agentic-gateway-core-1": 30, "agentic-gateway-core-2": 20 },
         {
           get: (target, key) =>
             typeof key === "string" ? (target[key] ?? 39) : Reflect.get(target, key),
         },
       );
       const compactSpy = vi
-        .spyOn(testTimings, "readCompactGroupTimings")
+        .spyOn(placementTimings, "readCompactGroupTimings")
         .mockReturnValue(compactCosts);
-      const spy = vi.spyOn(testTimings, "readRuntimePlacementTimings").mockReturnValue([]);
+      const spy = vi.spyOn(placementTimings, "readRuntimePlacementTimings").mockReturnValue([]);
       const options = {
         compactMode,
         runnerBackend: "hybrid",
         includeReleaseOnlyPluginShards: false,
       };
       try {
+        if (gatewayRecipient) {
+          databaseWorkerCoreTestFiles.splice(
+            0,
+            databaseWorkerCoreTestFiles.length,
+            ...fixtureStorageFiles,
+          );
+        }
         fullSuiteVitestShards.splice(
           0,
           fullSuiteVitestShards.length,
@@ -722,13 +793,13 @@ describe("runtime placement observations", () => {
             }))
             .filter((shard) => shard.projects.length > 0),
           ...(gatewayRecipient
-            ? ["agentic-gateway-server-isolated", "agentic-agents-core-subagents"].map((name) => {
+            ? gatewayFixtureNames.map((name) => {
                 const config = `fixture-${name}.config.ts`;
                 return { name, config, projects: [config] };
               })
             : []),
         );
-        const before = createNodeTestShardBundles(options);
+        const before = createBundles(options);
         const runtimeGroups = before
           .flatMap((job) => job.groups)
           .filter((group) => group.pretestBuildMode === "runtime");
@@ -776,11 +847,11 @@ describe("runtime placement observations", () => {
               : 20,
         }));
         spy.mockImplementation((profile) => (profile === "blacksmith" ? blacksmith : []));
-        const after = createNodeTestShardBundles(options);
+        const after = createBundles(options);
         if (compactMode === "pull-request") {
-          expect(
-            createNodeTestShardBundles({ ...options, compactMode: undefined, compact: true }),
-          ).toEqual(after);
+          expect(createBundles({ ...options, compactMode: undefined, compact: true })).toEqual(
+            after,
+          );
         }
         expect(createSelectedNodeTestShardBundles(selected, { runnerBackend: "hybrid" })).toEqual(
           preciseBefore,
@@ -824,7 +895,9 @@ describe("runtime placement observations", () => {
             before.some(
               (original) =>
                 original.checkName === job.checkName &&
-                original.groups.some((group) => group.configs.includes(gatewayFixtureConfig)) &&
+                original.groups.some((group) =>
+                  group.configs.some((config) => gatewayFixtureConfigs.has(config)),
+                ) &&
                 original.pretestBuildMode === undefined &&
                 original.planConcurrency === 1,
             ),
@@ -855,7 +928,8 @@ describe("runtime placement observations", () => {
         );
         expect(crossing.length).toBeGreaterThan(0);
         for (const group of crossing) {
-          const measuredGateway = gatewayRecipient && group.configs.includes(gatewayFixtureConfig);
+          const measuredGateway =
+            gatewayRecipient && group.configs.some((config) => gatewayFixtureConfigs.has(config));
           expect(group.env?.OPENCLAW_VITEST_MAX_WORKERS, group.shard_name).toBe(
             measuredGateway ? "8" : "2",
           );
@@ -865,7 +939,7 @@ describe("runtime placement observations", () => {
             ? blacksmith.filter((entry) => !entry.configs.includes(runtimeConfig))
             : [],
         );
-        const unmeasured = createNodeTestShardBundles(options);
+        const unmeasured = createBundles(options);
         expect(unmeasured.map((job) => [job.checkName, job.runner, job.groups])).toEqual(
           before.map((job) => [job.checkName, job.runner, job.groups]),
         );
@@ -881,7 +955,7 @@ describe("runtime placement observations", () => {
             ? blacksmith.map((entry) => Object.assign({}, entry, { seconds: 1_000 }))
             : [],
         );
-        const unfit = createNodeTestShardBundles(options);
+        const unfit = createBundles(options);
         expect(groups(unfit)).toEqual(groups(before));
         expect(unfit.map((job) => [job.checkName, job.runner, job.groups])).toEqual(
           before.map((job) => [job.checkName, job.runner, job.groups]),
@@ -891,7 +965,16 @@ describe("runtime placement observations", () => {
         spy.mockRestore();
         compactSpy.mockRestore();
         gatewayConfigSpy?.mockRestore();
+        for (const inventorySpy of inventorySpies) {
+          inventorySpy.mockRestore();
+        }
+        databaseWorkerCoreTestFiles.splice(
+          0,
+          databaseWorkerCoreTestFiles.length,
+          ...originalDatabaseFiles,
+        );
         fullSuiteVitestShards.splice(0, fullSuiteVitestShards.length, ...originalShards);
+        vi.resetModules();
       }
     },
   );
