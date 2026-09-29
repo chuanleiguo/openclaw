@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setLoggerOverride } from "../logging/logger.js";
 import { testApi } from "../logging/logger.test-support.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import { requireNodeSqlite } from "./node-sqlite.js";
 import {
   adoptPreparedLocation,
@@ -146,7 +147,7 @@ it.each([
               ),
             ).toBe(false);
             expect(failures).toHaveLength(1);
-            expect(failures[0]).toBeInstanceOf(oldCleanup.SqliteSnapshotCleanupError);
+            expect(failures[0]).toBeInstanceOf(currentCleanup.SqliteSnapshotCleanupError);
             expect(failures[0]).toMatchObject({
               message: "SQLite snapshot still belongs to an active reader",
             });
@@ -217,78 +218,117 @@ it.each([
   expect(generationReleased).toBe(true);
 });
 
-it("retains prepared snapshot cleanup across source module reload", async () => {
-  const oldCleanup = await import("./sqlite-readonly-location-cleanup.js");
-  const oldSource = await import("./sqlite-snapshot-source.js");
+it("retains a snapshot source's cleanup owner across module reload", async () => {
   const { captureSqliteSnapshotStagingOwner } = await import("./sqlite-snapshot-staging-owner.js");
-  const { resolveRuntimeProcessEntrypointUrl } = await import("./runtime-process-url.js");
-  const { withRuntimeWorkerGeneration } = await import("./runtime-worker-generation.js");
-  vi.stubEnv("XDG_CACHE_HOME", root);
-  const sourcePath = path.join(root, "reload-source.sqlite");
-  const source = new (requireNodeSqlite().DatabaseSync)(sourcePath);
+  const source = path.join(root, "reload-source.sqlite");
+  const database = new (requireNodeSqlite().DatabaseSync)(source);
   try {
-    source.exec("CREATE TABLE marker(value TEXT); INSERT INTO marker VALUES('preserved');");
+    database.exec("CREATE TABLE marker(value TEXT); INSERT INTO marker VALUES('preserved');");
   } finally {
-    source.close();
+    database.close();
   }
-  const sourceBytes = fs.readFileSync(sourcePath);
-  const stagingUrl = resolveRuntimeProcessEntrypointUrl("sqliteSnapshotStaging");
-  let generationReleased = false;
-  await withRuntimeWorkerGeneration(
-    async (bind) => {
-      bind((url) => {
-        if (url.href !== stagingUrl.href) {
-          return url;
-        }
-        const retained = new URL(url);
-        retained.searchParams.set("snapshot-test-generation", "prepared-source-reload");
-        return retained;
-      });
-      const owner = captureSqliteSnapshotStagingOwner();
-      const prime = oldSource.startSqliteReadOnlyLocationAsync(sourcePath, {
-        preserveSourceArtifacts: true,
-        signal: new AbortController().signal,
-      });
-      try {
-        const prepared = await prime.result;
-        expect(await prepared.startCleanup().result).toBe(true);
-      } finally {
-        await prime.startClose().result;
-      }
-      vi.resetModules();
-      const currentSource = await import("./sqlite-snapshot-source.js");
-      const currentOwner = await import("./sqlite-snapshot-staging-owner.js");
-      expect(currentOwner.captureSqliteSnapshotStagingOwner()).toBe(owner);
-      const preparation = currentSource.startSqliteReadOnlyLocationAsync(sourcePath, {
-        preserveSourceArtifacts: true,
-        signal: new AbortController().signal,
-      });
-      try {
-        const prepared = await preparation.result;
-        const reader = new (requireNodeSqlite().DatabaseSync)(prepared.location, {
-          readOnly: true,
-        });
-        try {
-          expect(reader.prepare("SELECT value FROM marker").get()).toEqual({ value: "preserved" });
-        } finally {
-          reader.close();
-        }
-        expect(await prepared.startCleanup().result).toBe(true);
-        expect(fs.existsSync(prepared.location)).toBe(false);
-        expect(fs.readFileSync(sourcePath)).toEqual(sourceBytes);
-      } finally {
-        const outcome = preparation.read();
-        if (outcome.status === "fulfilled" && outcome.value.cleanupRoot) {
-          expect(await oldCleanup.removeTempDirectoryAsync(outcome.value.cleanupRoot)).toBe(true);
-        }
-        await preparation.startClose().result;
-      }
-    },
-    async () => {
-      generationReleased = true;
-    },
-  );
-  expect(generationReleased).toBe(true);
+  const original = fs.readFileSync(source);
+  vi.stubEnv("XDG_CACHE_HOME", root);
+  const options = { preserveSourceArtifacts: true, signal: new AbortController().signal };
+  const first = startSqliteReadOnlyLocationAsync(source, options);
+  try {
+    expect(await (await first.result).cleanupAsync()).toBe(true);
+  } finally {
+    await first.startClose().result;
+  }
+  const originalOwner = captureSqliteSnapshotStagingOwner();
+  vi.resetModules();
+  const currentSource = await import("./sqlite-snapshot-source.js");
+  const currentCleanup = await import("./sqlite-readonly-location-cleanup.js");
+  const request = currentSource.startSqliteReadOnlyLocationAsync(source, options);
+  const prepared = await request.result;
+  const directory = prepared.cleanupRoot;
+  if (!directory) {
+    throw new Error("Expected the retained snapshot's cleanup root");
+  }
+  const releaseReader = currentCleanup.retainSnapshotTempDirectory(directory);
+  try {
+    const failures: unknown[] = [];
+    expect(
+      await currentCleanup.removeTempDirectoryAsync(directory, (error) => failures.push(error)),
+    ).toBe(false);
+    expect(failures).toEqual([
+      expect.objectContaining({ message: "SQLite snapshot still belongs to an active reader" }),
+    ]);
+    expect(fs.existsSync(prepared.location)).toBe(true);
+    await expect(originalOwner.retainDirectory(directory).startRetire().result).rejects.toThrow(
+      "SQLite snapshot still belongs to an active reader",
+    );
+    expect(fs.existsSync(prepared.location)).toBe(true);
+    releaseReader();
+    expect(await prepared.cleanupAsync()).toBe(true);
+    expect(fs.existsSync(directory)).toBe(false);
+    expect(fs.readFileSync(source)).toEqual(original);
+  } finally {
+    releaseReader();
+    if (fs.existsSync(directory)) {
+      await originalOwner.retainDirectory(directory).startRetire().result;
+    }
+    expect(await currentCleanup.removeTempDirectoryAsync(directory)).toBe(true);
+    expect(await prepared.cleanupAsync()).toBe(true);
+    await request.startClose().result;
+  }
+});
+
+it("joins reloaded snapshot consumers before original signal cleanup", async () => {
+  const originalCleanup = await import("./sqlite-readonly-location-cleanup.js");
+  vi.resetModules();
+  const currentCleanup = await import("./sqlite-readonly-location-cleanup.js");
+  const directory = path.join(root, "consumer-snapshot");
+  const location = path.join(directory, "database.sqlite");
+  fs.mkdirSync(directory);
+  fs.writeFileSync(location, "snapshot bytes");
+  const prepared = currentCleanup.adoptPreparedLocation(location, directory);
+  const entered = createDeferredCore();
+  const finish = createDeferredCore();
+  const consumer = currentCleanup.withPreparedSqliteSnapshot(prepared, async (snapshot) => {
+    entered.resolve();
+    await finish.promise;
+    expect(fs.readFileSync(snapshot, "utf8")).toBe("snapshot bytes");
+    return "read complete";
+  });
+  const stop = vi.fn();
+  void currentCleanup.retainSnapshotWork(consumer, stop);
+  await entered.promise;
+  const cleanup = originalCleanup.cleanupSnapshotOperations();
+  try {
+    expect(stop).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(location, "utf8")).toBe("snapshot bytes");
+    finish.resolve();
+    expect(await consumer).toBe("read complete");
+    await cleanup;
+    expect(fs.existsSync(directory)).toBe(false);
+  } finally {
+    finish.resolve();
+    await Promise.allSettled([consumer, cleanup]);
+  }
+});
+
+it("retires the current snapshot during shared cleanup despite stale caller custody", async () => {
+  const originalCleanup = await import("./sqlite-readonly-location-cleanup.js");
+  const directory = path.join(root, "reused-snapshot");
+  const location = path.join(directory, "database.sqlite");
+  fs.mkdirSync(directory);
+  const original = originalCleanup.adoptPreparedLocation(location, directory);
+  vi.resetModules();
+  const currentCleanup = await import("./sqlite-readonly-location-cleanup.js");
+  currentCleanup.retainSnapshotTempDirectory(directory)();
+  expect(await original.cleanupAsync()).toBe(true);
+  fs.mkdirSync(directory);
+  fs.writeFileSync(location, "replacement snapshot");
+  const replacement = originalCleanup.adoptPreparedLocation(location, directory);
+  try {
+    await currentCleanup.cleanupSnapshotOperations();
+    expect(fs.existsSync(directory)).toBe(false);
+    expect(await currentCleanup.removeTempDirectoryAsync(directory)).toBe(true);
+  } finally {
+    expect(await replacement.cleanupAsync()).toBe(true);
+  }
 });
 
 it("keeps synchronous and asynchronous token cleanup in separate snapshot flights", async () => {

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { MessagePort, type Worker } from "node:worker_threads";
+import type { Worker } from "node:worker_threads";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 import {
@@ -47,6 +47,7 @@ import {
   closeOpenClawStateDatabaseAsync,
 } from "../state/openclaw-state-db-cache.js";
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
+import * as stateReadWorker from "../state/openclaw-state-read-worker.js";
 import {
   withOpenClawTestState,
   type OpenClawTestState,
@@ -400,20 +401,6 @@ it.each([
       invalidateRegisteredAgentDatabasesMemo({ path: registryPath });
       let started = false;
       let finished = false;
-      // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply preserves the sending port below.
-      const post = MessagePort.prototype.postMessage;
-      const retainedDispatch = vi
-        .spyOn(MessagePort.prototype, "postMessage")
-        .mockImplementation(function (
-          this: MessagePort,
-          ...args: Parameters<MessagePort["postMessage"]>
-        ) {
-          const envelope = asOptionalRecord(args[0]);
-          if (envelope?.type === "post") {
-            observed.dispatch?.(envelope.value);
-          }
-          return Reflect.apply(post, this, args);
-        });
       observed.dispatch = (message) => {
         const input = asOptionalRecord(asOptionalRecord(message)?.input);
         const params = asOptionalRecord(asOptionalRecord(input?.request)?.params);
@@ -439,6 +426,28 @@ it.each([
         registration.finish();
         finished = true;
       };
+      const captureSource = stateReadWorker.captureOpenClawStateReadSource;
+      const registryReads = vi
+        .spyOn(stateReadWorker, "captureOpenClawStateReadSource")
+        .mockImplementation(() => {
+          const source = captureSource();
+          return {
+            ...source,
+            createTransport(command) {
+              const transport = source.createTransport(command);
+              if (command.type !== "agentDatabaseRegistry.read") {
+                return transport;
+              }
+              return {
+                ...transport,
+                startRead(...args) {
+                  observed.dispatch?.({ input: { command } });
+                  return transport.startRead(...args);
+                },
+              };
+            },
+          };
+        });
       try {
         expect((await a.read()).messages.map(readChatHistoryMessageId)).toEqual([
           "registration-a-message",
@@ -446,7 +455,7 @@ it.each([
         expect(started && finished).toBe(true);
       } finally {
         observed.dispatch = undefined;
-        retainedDispatch.mockRestore();
+        registryReads.mockRestore();
         registration.finish();
       }
     });
