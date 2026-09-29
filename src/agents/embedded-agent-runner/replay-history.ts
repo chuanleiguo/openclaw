@@ -35,13 +35,11 @@ import {
   normalizeOpenAIResponsesToolCallIds,
   sanitizeGoogleTurnOrdering,
   sanitizeSessionMessagesImages,
-  validateAnthropicTurns,
-  validateGeminiTurns,
 } from "../embedded-agent-helpers.js";
 import {
   providerRequiresSignedThinking,
   shouldAllowProviderOwnedThinkingReplay,
-  shouldMergeConsecutiveUserTurns,
+  validateRuntimeReplayTurns,
 } from "../embedded-agent-helpers/turns.js";
 import { resolveImageSanitizationLimits } from "../image-sanitization.js";
 import type { AgentMessage } from "../runtime/index.js";
@@ -867,13 +865,6 @@ export async function validateReplayTurns(params: {
     }
   }
 
-  const validatedGemini = policy.validateGeminiTurns
-    ? validateGeminiTurns(params.messages)
-    : params.messages;
-  return policy.validateAnthropicTurns
-    ? validateAnthropicTurns(validatedGemini, {
-        mergeConsecutiveUserTurns: shouldMergeConsecutiveUserTurns(policy, params.modelApi),
-      })
-    : validatedGemini;
+  return validateRuntimeReplayTurns(params.messages, policy, params.modelApi);
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

@@ -1426,7 +1426,7 @@ describe("sanitizeSessionHistory", () => {
       sessionId: TEST_SESSION_ID,
       policy: basePolicy,
     });
-    expect(bedrock.map((msg) => msg.role)).toEqual(["user", "assistant"]);
+    expect(bedrock.map((msg) => msg.role)).toEqual(["user", "user", "assistant"]);
   });
 
   it("strips copied inbound metadata from assistant replay text", async () => {

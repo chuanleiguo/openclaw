@@ -8,31 +8,43 @@ import {
   stageSessionPendingInput,
   upsertSessionEntryCore,
 } from "../../../config/sessions/session-accessor.js";
+import { withSessionPendingInputPersistence } from "../../../config/sessions/session-accessor.pending-inputs.js";
+import { createUserTurnTranscriptRecorder } from "../../../sessions/user-turn-transcript.js";
 import { withOpenClawTestState } from "../../../test-utils/openclaw-test-state.js";
-import type { AgentMessage } from "../../runtime/index.js";
 import { guardSessionManager } from "../../session-tool-result-guard-wrapper.js";
-import type { AgentSession } from "../../sessions/index.js";
+import {
+  createAssistant,
+  createAssistantResultStream,
+  createTestSession,
+  registerAgentSessionLoopTestLifecycle,
+  streamMocks,
+  testModel,
+} from "../../sessions/agent-session-loop-correctness.test-support.js";
+import { createResourceLoader } from "../../sessions/agent-session-loop-resource-loader.test-support.js";
 import { SessionManager } from "../../sessions/session-manager.js";
-import { makeAssistantMessageFixture } from "../../test-helpers/assistant-message-fixtures.js";
+import { resolveTranscriptPolicy } from "../../transcript-policy.js";
+import { validateReplayTurns } from "../replay-history.js";
 import { prepareEmbeddedAttemptSessionBoundary } from "./attempt-session-prepare.js";
+import { wrapStreamFnSanitizeMalformedToolCalls } from "./attempt-tool-call-replay-sanitization.js";
 
-function createActiveSession(messages: AgentMessage[]) {
-  const activeSession = {
-    agent: { state: { messages }, convertToLlm: vi.fn((input: AgentMessage[]) => input) },
-  } as unknown as Pick<AgentSession, "agent">;
-  return { activeSession };
-}
+registerAgentSessionLoopTestLifecycle();
 
 describe("live pending inputs at the attempt boundary", () => {
   it.each([
-    { metadata: false, collected: false, excluded: false },
-    { metadata: true, collected: false, excluded: false },
-    { metadata: true, collected: true, excluded: false },
-    { metadata: false, collected: false, excluded: true },
+    { metadata: false, collected: false, excluded: false, custody: "live" },
+    { metadata: true, collected: false, excluded: false, custody: "live" },
+    { metadata: true, collected: true, excluded: false, custody: "live" },
+    { metadata: false, collected: false, excluded: true, custody: "live" },
+    { metadata: true, collected: false, excluded: false, custody: "live", mergedHistory: true },
+    { metadata: false, collected: false, excluded: false, custody: "cancelled" },
+    { metadata: true, collected: true, excluded: false, custody: "revoked" },
   ])(
-    "preserves a live queued turn across announce ($metadata, $collected, $excluded)",
-    async ({ metadata, collected, excluded }) => {
+    "keeps announcement effects separate from $custody input (metadata=$metadata, collected=$collected, excluded=$excluded, merged=$mergedHistory)",
+    async ({ metadata, collected, excluded, custody, mergedHistory }) => {
       await withOpenClawTestState({ label: "live-input-orphan" }, async (state) => {
+        const model = mergedHistory
+          ? { ...testModel, api: "bedrock-converse-stream" as const, provider: "amazon-bedrock" }
+          : testModel;
         const target = {
           agentId: "main",
           sessionId: "live-input-session",
@@ -41,26 +53,27 @@ describe("live pending inputs at the attempt boundary", () => {
         };
         await upsertSessionEntryCore(target, { sessionId: target.sessionId, updatedAt: 1 });
         const manager = guardSessionManager(SessionManager.open(target, state.workspaceDir), {
-          runId: "announce-run",
+          runId: "prior-run",
         });
-        const prior = makeAssistantMessageFixture({
-          content: [{ type: "text", text: "prior reply" }],
-          stopReason: "stop",
-          timestamp: 1,
-        });
+        const prior = createAssistant(model, [{ type: "text", text: "prior reply" }]);
         manager.appendMessage(prior);
         const message: Parameters<typeof stageSessionPendingInput>[1]["message"] = {
-          role: "user" as const,
+          role: "user",
           content: "queued user request",
           timestamp: 2,
           idempotencyKey: "queued-run:user",
           ...(excluded ? { excludeFromContext: true } : {}),
         };
+        let current = true;
         const source = expectDefined(
           await stageSessionPendingInput(target, {
             runId: "queued-run",
             message,
-            assertCurrent: () => {},
+            assertCurrent: () => {
+              if (!current) {
+                throw new Error("Synthetic admission revoked");
+              }
+            },
           }),
           "Expected queued receipt",
         );
@@ -73,9 +86,14 @@ describe("live pending inputs at the attempt boundary", () => {
               "Expected aggregate receipt",
             )
           : source;
+        const recorder = createUserTurnTranscriptRecorder({
+          message: receipt.message,
+          target: { ...target, sessionEntry: { sessionId: target.sessionId, updatedAt: 1 } },
+          updateMode: "none",
+        });
         try {
           const promoted = expectDefined(
-            await receipt.run(() => appendTranscriptMessage(target, { message: receipt.message })),
+            await receipt.run(() => recorder.persistApproved()),
             "Expected promoted input",
           );
           expect(promoted).toMatchObject({ appended: true });
@@ -86,9 +104,20 @@ describe("live pending inputs at the attempt boundary", () => {
           );
           if (metadata) {
             await announce.appendThinkingLevelChange("low");
-            await announce.appendModelChange("openai", "synthetic-model");
+            await announce.appendModelChange(testModel.provider, testModel.id);
           }
-          const { activeSession } = createActiveSession(announce.buildSessionContext().messages);
+          const beforeStart = vi.fn(async () => {
+            if (custody === "cancelled") {
+              receipt.finish("cancelled");
+            } else if (custody === "revoked") {
+              current = false;
+            }
+          });
+          const { session: activeSession } = await createTestSession({
+            model,
+            sessionManager: announce,
+            resourceLoader: createResourceLoader(new Map([["before_agent_start", [beforeStart]]])),
+          });
           const boundary = await prepareEmbeddedAttemptSessionBoundary({
             activeSession,
             attempt: { prompt: "announce child result", trigger: "user" },
@@ -98,39 +127,133 @@ describe("live pending inputs at the attempt boundary", () => {
             sessionManager: announce,
             setActiveSessionSystemPrompt: vi.fn(),
           });
-          announce.appendMessage({
-            role: "user",
-            content: boundary.orphanRepair?.contextEnginePrompt ?? "announce child result",
-            timestamp: 3,
-          });
-          announce.appendMessage(
-            makeAssistantMessageFixture({
-              content: [{ type: "text", text: "child result delivered" }],
-              stopReason: "stop",
-              timestamp: 4,
-            }),
-          );
-          // Replay through the original receipt must keep the exact promoted anchor.
-          await expect(
-            receipt.run(() => appendTranscriptMessage(target, { message: receipt.message })),
-          ).resolves.toMatchObject({ appended: false, messageId: promoted.messageId });
-          expect(boundary.orphanRepair).toBeUndefined();
           expect(activeSession.agent.state.messages).toMatchObject([prior]);
+          streamMocks.streamSimple.mockImplementation((replyModel) =>
+            createAssistantResultStream(
+              createAssistant(replyModel, [{ type: "text", text: "child result delivered" }]),
+            ),
+          );
+          // The real SDK hook runs after boundary preparation and before provider/SQLite effects.
+          await activeSession.prompt(
+            boundary.orphanRepair?.contextEnginePrompt ?? "announce child result",
+            {
+              expandPromptTemplates: false,
+            },
+          );
+          expect(beforeStart).toHaveBeenCalledOnce();
+          expect(activeSession.getLastAssistantText()).toBe("child result delivered");
+          expect(streamMocks.streamSimple).toHaveBeenCalledOnce();
+          expect(
+            JSON.stringify(streamMocks.streamSimple.mock.calls[0]?.[1].messages),
+          ).not.toContain("queued user request");
+          expect(boundary.orphanRepair).toBeUndefined();
           const rebuilt = announce.buildSessionContext().messages;
           expect(JSON.stringify(await activeSession.agent.convertToLlm(rebuilt))).not.toContain(
             "queued user request",
           );
+          // Cancellation revokes execution, not exact mirroring of an already committed input.
+          await expect(
+            withSessionPendingInputPersistence(receipt, () =>
+              appendTranscriptMessage(target, { message: receipt.message }),
+            ),
+          ).resolves.toMatchObject({ appended: false, messageId: promoted.messageId });
           const reopened = SessionManager.openBounded(target, { maxBytes: 8192, maxEvents: 30 });
           expect(
             reopened.getBranch().filter((entry) => entry.id === promoted.messageId),
           ).toHaveLength(excluded ? 0 : 1);
-          expect(
-            reopened.buildSessionContext().messages.filter((entry) => entry.role === "user"),
-          ).toMatchObject(
-            excluded
-              ? [{ content: "announce child result" }]
-              : [{ content: "queued user request" }, { content: "announce child result" }],
-          );
+          expect(reopened.buildSessionContext().messages.at(-1)).toMatchObject({
+            role: "assistant",
+            content: [{ type: "text", text: "child result delivered" }],
+          });
+          if (custody !== "live") {
+            const before = reopened.getBranch();
+            expect(() => receipt.run(() => activeSession.prompt("queued user request"))).toThrow(
+              custody === "cancelled" ? "ownership ended" : "Synthetic admission revoked",
+            );
+            expect(streamMocks.streamSimple).toHaveBeenCalledOnce();
+            expect(SessionManager.open(target).getBranch()).toEqual(before);
+          } else if (!excluded) {
+            const { session: original } = await createTestSession({
+              model,
+              sessionManager: guardSessionManager(reopened, {
+                runId: "queued-run",
+                preparedUserTurnMessage: promoted.message,
+                preparedUserTurnTranscriptRecorder: recorder,
+              }),
+            });
+            streamMocks.streamSimple.mockImplementation((replyModel) =>
+              createAssistantResultStream(
+                createAssistant(replyModel, [{ type: "text", text: "original user reply" }]),
+              ),
+            );
+            await receipt.run(() =>
+              prepareEmbeddedAttemptSessionBoundary({
+                activeSession: original,
+                attempt: {
+                  prompt: "queued user request",
+                  trigger: "user",
+                  userTurnTranscriptRecorder: recorder,
+                },
+                getUserTranscriptContexts: () => undefined,
+                isRawModelRun: false,
+                preparedUserTurnMessage: promoted.message,
+                sessionManager: original.sessionManager,
+                setActiveSessionSystemPrompt: vi.fn(),
+              }),
+            );
+            if (mergedHistory) {
+              original.agent.state.messages = await validateReplayTurns({
+                messages: original.agent.state.messages,
+                modelApi: model.api,
+                provider: model.provider,
+                model,
+                workspaceDir: state.workspaceDir,
+              });
+              original.agent.streamFn = wrapStreamFnSanitizeMalformedToolCalls(
+                original.agent.streamFn,
+                undefined,
+                resolveTranscriptPolicy({ modelApi: model.api, provider: model.provider, model }),
+                model.provider,
+              );
+            }
+
+            await receipt.run(() =>
+              original.prompt("queued user request", {
+                persistedUserIdempotencyKey: receipt.message.idempotencyKey,
+                expandPromptTemplates: false,
+              }),
+            );
+            expect(original.messages.at(-1)).toMatchObject({
+              stopReason: "stop",
+            });
+            expect(original.getLastAssistantText()).toBe("original user reply");
+            expect(streamMocks.streamSimple).toHaveBeenCalledTimes(2);
+            const originalContext = JSON.stringify(
+              streamMocks.streamSimple.mock.calls[1]?.[1].messages,
+            );
+            expect(originalContext.match(/queued user request/g)).toHaveLength(1);
+            expect(originalContext).toContain("announce child result");
+            if (mergedHistory) {
+              expect(
+                streamMocks.streamSimple.mock.calls[1]?.[1].messages.map(
+                  (providerMessage: { role: string }) => providerMessage.role,
+                ),
+              ).toEqual(["assistant", "user"]);
+              expect(
+                original.agent.state.messages.filter(
+                  (runtimeMessage) => runtimeMessage.role === "user",
+                ),
+              ).toHaveLength(2);
+            }
+
+            expect(
+              SessionManager.open(target)
+                .getBranch()
+                .filter((entry) => entry.id === promoted.messageId),
+            ).toHaveLength(1);
+            original.dispose();
+          }
+          activeSession.dispose();
         } finally {
           receipt.finish("interrupted");
         }

@@ -447,3 +447,22 @@ export function validateAnthropicTurns(
   }
   return mergeConsecutiveUserMessages(stripped);
 }
+
+/** Keep admitted Bedrock identities in runtime history; the stream boundary merges users. */
+export function validateRuntimeReplayTurns(
+  messages: AgentMessage[],
+  policy: Pick<
+    TranscriptPolicy,
+    "validateGeminiTurns" | "validateAnthropicTurns" | "appendOnlyRuntimeContext"
+  >,
+  modelApi?: string | null,
+): AgentMessage[] {
+  const validatedGemini = policy.validateGeminiTurns ? validateGeminiTurns(messages) : messages;
+  return policy.validateAnthropicTurns
+    ? validateAnthropicTurns(validatedGemini, {
+        mergeConsecutiveUserTurns:
+          modelApi !== "bedrock-converse-stream" &&
+          shouldMergeConsecutiveUserTurns(policy, modelApi),
+      })
+    : validatedGemini;
+}

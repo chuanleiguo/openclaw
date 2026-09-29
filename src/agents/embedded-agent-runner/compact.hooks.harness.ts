@@ -975,8 +975,6 @@ export async function loadCompactHooksHarness(options: { durableSession?: boolea
     return {
       ensureSessionHeader: vi.fn(async () => {}),
       pickFallbackThinkingLevel,
-      validateAnthropicTurns: vi.fn((m: unknown[]) => m),
-      validateGeminiTurns: vi.fn((m: unknown[]) => m),
     };
   });
 

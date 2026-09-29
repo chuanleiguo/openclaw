@@ -936,37 +936,33 @@ test("sessions.reset closes child ACP runtimes concurrently so stuck children do
   // Parent cancel resolves immediately; child cancels hang until released. With
   // sequential cleanup only the first child would dispatch; concurrent cleanup
   // dispatches all three before any resolves.
-  const releaseChildren: Array<() => void> = [];
+  const childrenReleased = createDeferred();
   acpManagerMocks.cancelSession.mockImplementation(async (...args: unknown[]) => {
     const req = args[0] as { sessionKey?: string } | undefined;
     if (req?.sessionKey === "agent:main:main") {
       return;
     }
-    await new Promise<void>((resolve) => {
-      releaseChildren.push(resolve);
-    });
+    await childrenReleased.promise;
   });
 
+  const resetPromise = directSessionReq<{ ok: true }>("sessions.reset", {
+    key: "main",
+  });
   try {
-    const resetPromise = directSessionReq<{ ok: true }>("sessions.reset", {
-      key: "main",
-    });
-
     await vi.waitFor(() => {
       const childCancels = (
         acpManagerMocks.cancelSession.mock.calls as unknown as Array<[{ sessionKey?: string }]>
       ).filter((call) => call[0]?.sessionKey?.startsWith("agent:main:acp-child"));
       expect(childCancels.length).toBe(3);
     });
-
-    for (const release of releaseChildren) {
-      release();
-    }
-    const reset = await resetPromise;
-    expect(reset.ok).toBe(true);
   } finally {
+    // Late cancels share the released gate; join reset before fixture teardown.
+    childrenReleased.resolve();
     acpManagerMocks.cancelSession.mockImplementation(async () => {});
+    await Promise.allSettled([resetPromise]);
   }
+  const reset = await resetPromise;
+  expect(reset.ok).toBe(true);
 });
 
 test("sessions.reset does not emit lifecycle events when key does not exist", async () => {

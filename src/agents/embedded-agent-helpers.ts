@@ -58,5 +58,3 @@ export {
 } from "./embedded-agent-helpers/messaging-dedupe.js";
 
 export { pickFallbackThinkingLevel } from "./embedded-agent-helpers/thinking.js";
-
-export { validateAnthropicTurns, validateGeminiTurns } from "./embedded-agent-helpers/turns.js";
