@@ -7,7 +7,10 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import type { OpenClawAgentDatabaseOptions } from "../../state/openclaw-agent-db-contract.js";
 import { registerOpenClawAgentDatabaseAsyncResource } from "../../state/openclaw-agent-db-resources.js";
-import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
+import {
+  isSameOpenClawAgentDatabasePath,
+  resolveOpenClawAgentSqlitePath,
+} from "../../state/openclaw-agent-db.paths.js";
 import {
   captureOpenClawStateDatabaseReadAdmission,
   registerOpenClawStateDatabaseAsyncResource,
@@ -132,7 +135,8 @@ class ArchiveSession {
       request.plans.some(
         (plan) =>
           normalizeAgentId(plan.agentId) !== this.options.agentId ||
-          path.resolve(plan.databasePath) !== this.options.path,
+          (path.resolve(plan.databasePath) !== this.options.path &&
+            !isSameOpenClawAgentDatabasePath(plan.databasePath, this.options.path)),
       )
     ) {
       throw new Error("SQLite archive request changed its captured database owner");

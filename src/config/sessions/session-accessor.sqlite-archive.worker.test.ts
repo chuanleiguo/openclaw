@@ -259,10 +259,20 @@ describe("SQLite transcript archive worker", () => {
     }
   });
 
-  it("counts lifecycle archives for a custom store whose parent directory is named agent", async () => {
-    storePath = path.join(tempDir, "backup", "agent", "sessions.json");
+  it("counts lifecycle archives through a cold custom-store directory alias named agent", async () => {
+    const physicalDirectory = path.join(tempDir, "backup");
+    const directoryAlias = path.join(tempDir, "backup-alias");
+    fs.mkdirSync(physicalDirectory);
+    fs.symlinkSync(
+      physicalDirectory,
+      directoryAlias,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    storePath = path.join(directoryAlias, "agent", "sessions.json");
     const transcript = event("custom-directory-archive", "retain the custom-store transcript");
     const target = await seed(transcript.id, [transcript]);
+    await waitForSessionTranscriptIndexReconcilesInStateDir(tempDir);
+    await closeOpenClawAgentDatabasesAsync(tempDir);
     const result = await deletion(target.sessionKey);
     expect(result.deleted).toBe(true);
     const archivePath = result.archivedTranscripts[0]?.archivedPath ?? "";
