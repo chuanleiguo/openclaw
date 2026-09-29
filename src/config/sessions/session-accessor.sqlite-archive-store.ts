@@ -49,7 +49,7 @@ type SessionArchivePublicationStorage = {
 
 /** Publishes derived archive files after their canonical rows and deletions commit. */
 export async function publishSessionStateArchives(
-  scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">,
+  scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "ownerStorePath" | "path">,
   requested: readonly SessionLifecycleArchivedTranscript[],
   storage?: SessionArchivePublicationStorage,
 ): Promise<SessionLifecycleArchivedTranscript[]> {
@@ -245,7 +245,7 @@ const ARCHIVE_RETENTION_BATCH_SIZE = 256;
 export async function prunePublishedSessionArchivesByRetention(params: {
   nowMs?: number;
   rules: readonly { olderThanMs: number; reason: "deleted" | "reset" }[];
-  scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">;
+  scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "ownerStorePath" | "path">;
 }): Promise<number> {
   const rules = new Map(
     params.rules
