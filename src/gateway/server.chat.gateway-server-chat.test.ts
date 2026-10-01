@@ -37,10 +37,7 @@ import { drainOpenClawAgentWriteQueuesForTest } from "../state/openclaw-agent-wr
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 import { observeGatewayRunExecution } from "./agent-command.test-helpers.js";
 import { flushPendingSessionsChangedEvents } from "./server-methods/session-change-event.js";
-import {
-  createMainChatSessionStoreFixture,
-  replaceMainChatTranscriptMessages,
-} from "./server.chat-session-store.test-support.js";
+import { createMainChatSessionStoreFixture } from "./server.chat-session-store.test-support.js";
 import {
   collectHistoryTextValues,
   createGatewayHistoryText,
@@ -136,7 +133,7 @@ describe("gateway server chat", () => {
     messages: Array<Record<string, unknown>>,
   ): Promise<unknown[]> => {
     return withMainSessionStore(async () => {
-      await replaceMainChatTranscriptMessages(messages);
+      await replaceMainTranscriptMessages(messages);
 
       const res = await rpcReq<{ messages?: unknown[] }>(ws, "chat.history", {
         sessionKey: "main",
@@ -144,6 +141,24 @@ describe("gateway server chat", () => {
       expect(res.ok).toBe(true);
       return res.payload?.messages ?? [];
     });
+  };
+
+  const replaceMainTranscriptMessages = async (
+    messages: Record<string, unknown>[],
+  ): Promise<void> => {
+    const storePath = testState.sessionStorePath;
+    if (!storePath) {
+      throw new Error("session store path was not initialized");
+    }
+    const events = messages.map((message, index) => ({
+      message,
+      id: `message-${index}`,
+      type: "message",
+    }));
+    await replaceTranscriptEvents(
+      { agentId: "main", sessionId: "sess-main", sessionKey: "main", storePath },
+      events,
+    );
   };
 
   const mainSessionStore = createMainChatSessionStoreFixture(settleGatewayFixture);
@@ -338,8 +353,8 @@ describe("gateway server chat", () => {
     });
   });
 
-  const waitForAgentRunOk = async (runId: string, timeoutMs = 1_000) => {
-    const res = await rpcReq(ws, "agent.wait", {
+  const waitForAgentRunOk = async (runId: string, timeoutMs = 1_000, socket = ws) => {
+    const res = await rpcReq(socket, "agent.wait", {
       runId,
       timeoutMs,
     });
@@ -347,10 +362,10 @@ describe("gateway server chat", () => {
     expect(res.payload?.status, JSON.stringify(res.payload)).toBe("ok");
     return res;
   };
-  const waitForAgentRunDrained = async (runId: string) => {
+  const waitForAgentRunDrained = async (runId: string, socket = ws) => {
     await requestExecution.waitForCompletion(runId);
     expect(getActiveGatewayRootWorkCount()).toBe(0);
-    await waitForAgentRunOk(runId, 0);
+    await waitForAgentRunOk(runId, 0, socket);
   };
   const abortChatRun = async (runId: string) => {
     const res = await rpcReq(ws, "chat.abort", {
@@ -961,7 +976,7 @@ describe("gateway server chat", () => {
         },
       });
 
-      await replaceMainChatTranscriptMessages(
+      await replaceMainTranscriptMessages(
         Array.from({ length: 201 }, (_, i) => ({
           role: "user",
           content: [{ type: "text", text: `m${i}` }],
@@ -1496,7 +1511,7 @@ describe("gateway server chat", () => {
 
   test("routes /btw replies through side-result events without transcript injection", async () => {
     await withMainSessionStore(async () => {
-      await replaceMainChatTranscriptMessages([
+      await replaceMainTranscriptMessages([
         createGatewayHistoryText("user", "main thread context", Date.now()),
       ]);
       mockDispatchedReplies("final", [{ text: "323", btw: { question: "what is 17 * 19?" } }]);
@@ -1660,13 +1675,7 @@ describe("gateway server chat", () => {
         });
         expect(sendRes.ok).toBe(true);
 
-        await requestExecution.waitForCompletion("idem-write-scope-verbose-no-persist");
-        const waitRes = await rpcReq(scopedWs, "agent.wait", {
-          runId: "idem-write-scope-verbose-no-persist",
-          timeoutMs: 1_000,
-        });
-        expect(waitRes.ok).toBe(true);
-        expect(waitRes.payload?.status).toBe("ok");
+        await waitForAgentRunDrained("idem-write-scope-verbose-no-persist", scopedWs);
 
         const sessionStorePath = testState.sessionStorePath;
         if (!sessionStorePath) {

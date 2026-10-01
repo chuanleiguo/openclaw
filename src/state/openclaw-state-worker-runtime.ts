@@ -55,8 +55,12 @@ import { mutateSessionGroupCatalogInDatabase } from "../gateway/session-group-ca
 import { isWorkerInferenceStoreCommand } from "../gateway/worker-environments/inference-store.worker-contract.js";
 import { executeWorkerInferenceStoreCommand } from "../gateway/worker-environments/inference-store.worker.js";
 import { startWorkerPlacementDispatchInWorker } from "../gateway/worker-environments/placement-dispatch-store.worker.js";
+import { isPlacementSessionToolCommand } from "../gateway/worker-environments/placement-session-tool-operations.worker-contract.js";
+import { executePlacementSessionToolCommand } from "../gateway/worker-environments/placement-session-tool-operations.worker.js";
 import { isPlacementTurnClaimCommand } from "../gateway/worker-environments/placement-turn-claims.worker-contract.js";
 import { executePlacementTurnClaimCommand } from "../gateway/worker-environments/placement-turn-claims.worker.js";
+import { isWorkspaceJournalWriteCommand } from "../gateway/worker-environments/placement-workspace-journal.worker-contract.js";
+import { executeWorkspaceJournalCommand } from "../gateway/worker-environments/placement-workspace-journal.worker.js";
 import { isWorkerEnvironmentCommand } from "../gateway/worker-environments/store-worker-contract.js";
 import { executeWorkerEnvironmentCommand } from "../gateway/worker-environments/store.worker.js";
 import {
@@ -92,6 +96,7 @@ import {
   readTelemetryStateInWorker,
 } from "../infra/telemetry-store.kernel.js";
 import { persistInterruptedUpdateObservation } from "../infra/update-run-interruption-store.js";
+import { recordUpdateRunMutationInWorker } from "../infra/update-run-mutation.worker.js";
 import { reconcileUpdateRunCandidatesInWorker } from "../infra/update-run-reconciliation.worker.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { readRemoteModelCatalog } from "../model-catalog/remote-store.js";
@@ -213,6 +218,12 @@ export function executeSharedStateCommand(
   if (isWorkerInferenceStoreCommand(command)) {
     return executeWorkerInferenceStoreCommand(command, open());
   }
+  if (isWorkspaceJournalWriteCommand(command)) {
+    return executeWorkspaceJournalCommand(command, open());
+  }
+  if (isPlacementSessionToolCommand(command)) {
+    return executePlacementSessionToolCommand(command, open());
+  }
   if (isPlacementTurnClaimCommand(command)) {
     return executePlacementTurnClaimCommand(command, open());
   }
@@ -324,6 +335,11 @@ export function executeSharedStateCommand(
     return runOpenClawStateWriteTransaction(
       ({ db }) => upsertPluginBindingApprovalInDatabase(db, command.input),
       { database, path: context.databasePath, env: getSqliteWorkerStateContext().environment },
+    );
+  }
+  if (command.type === "updateRuns.recordStep" || command.type === "updateRuns.recordPhase") {
+    return recordUpdateRunMutationInWorker(command, stateOptions(), (stage) =>
+      requestSqliteWorkerOperationAdmission({ stage, facts: undefined }),
     );
   }
   if (command.type === "updateRuns.reconcile") {

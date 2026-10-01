@@ -241,6 +241,11 @@ describe("CI changed Node test plan", () => {
 
   it.each([
     {
+      source: "scripts/check-test-timeout-race-ratchet.mts",
+      targets: ["test/scripts/check-test-timeout-race-ratchet.test.ts"],
+      areas: ["scripts", "src/scripts", "test/scripts"],
+    },
+    {
       source: "ui/src/styles/chat/layout.css",
       areas: ["ui"],
       targets: [
@@ -278,6 +283,7 @@ describe("CI changed Node test plan", () => {
         "src/agents/command/delivery.restart-final.integration.test.ts",
         "src/auto-reply/reply/commands-acp.owner.test.ts",
         "src/auto-reply/reply/commands-allowlist.owner.test.ts",
+        "src/gateway/server.mcp-session-owner.test.ts",
       ],
       areas: ["src/channels"],
     },

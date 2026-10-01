@@ -31,13 +31,13 @@ vi.mock("../../state/openclaw-agent-canonical-validation-receipt.js", () => ({})
 vi.mock("../../state/openclaw-agent-db-readonly-open.js", () => ({}));
 vi.mock("../../state/openclaw-state-db-cache.js", () => ({}));
 vi.mock("../../state/openclaw-agent-db-identity.js", () => ({
-  createOpenClawAgentDatabaseClaim: () => ({ assertCurrent() {}, release() {} }),
   readOpenClawAgentDatabaseIdentity: () => ({
-    identity: "fixture-file",
-    birthtime: undefined,
-    incarnation: "fixture-open",
+    identity: "1:2",
+    birthtime: "1",
+    incarnation: "fixture-incarnation",
     filename: "/fixture/agent.sqlite",
   }),
+  createOpenClawAgentDatabaseClaim: () => ({ assertCurrent() {}, release() {} }),
 }));
 vi.mock("../../state/openclaw-agent-db-lease.js", () => ({
   assertOpenClawAgentDatabaseLease: () => {},
@@ -75,11 +75,6 @@ vi.mock("./session-accessor.sqlite-worker-coordination.js", () => ({
 vi.mock("./session-accessor.sqlite-reclamation.js", () => ({
   reclaimSqliteSessionInTransaction: () => ({ kind: "maintenance-statistics", value: true }),
 }));
-vi.mock("./session-accessor.sqlite-reclamation-commit.js", async (importOriginal) => {
-  const { SqliteReclamationRequestRefusedError } =
-    await importOriginal<typeof import("./session-accessor.sqlite-reclamation-commit.js")>();
-  return { markSqliteReclamationSettled: () => {}, SqliteReclamationRequestRefusedError };
-});
 
 it("keeps idle collection after buffered admission replies and cancels it for the next request", async () => {
   const { port1: parentPort, port2: worker } = new MessageChannel();

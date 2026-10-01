@@ -2,6 +2,7 @@ import { channel } from "node:diagnostics_channel";
 import nodeFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import { deleteSessionEntry, upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
 import {
@@ -141,146 +142,128 @@ describe("physical session disk usage", () => {
 
   it("joins real SDK mutation maintenance before native fixture drainage", async () => {
     const state = await createOpenClawTestState({ layout: "state-only" });
-    try {
-      await withRuntimeWorkerGeneration(
-        async (bind) => {
-          const retainedEntrypoints = new Set([
-            resolveRuntimeProcessEntrypointUrl("stateRead").href,
-            resolveRuntimeProcessEntrypointUrl("sqliteSnapshotStaging").href,
-          ]);
-          bind((url) => {
-            if (!retainedEntrypoints.has(url.href)) {
-              return url;
+    const storePath = path.join(state.sessionsDir(), "sessions.json");
+    const scope = { agentId: "main", env: state.env, storePath, sessionKey: "agent:main:fixture" };
+    const releasePreparation = createDeferredCore();
+    const mutationBodyFinished = createDeferredCore<boolean>();
+    const secondScanAdmitted = createDeferredCore();
+    const nativeRetired = createDeferredCore();
+    const releaseRetirement = createDeferredCore();
+    let scans = 0;
+    let observedSdkSweeps = 0;
+    let scanSpy = vi.spyOn(WorkerTaskPool.prototype, "run");
+    scanSpy.mockImplementation(function trackScan(
+      this: WorkerTaskPool<unknown, unknown>,
+      input,
+      options,
+    ) {
+      scanSpy.mockRestore();
+      const invoke = this.run.bind(this);
+      scanSpy = vi.spyOn(WorkerTaskPool.prototype, "run").mockImplementation(trackScan);
+      if (input !== storePath) {
+        return invoke(input, options);
+      }
+      const scan = ++scans;
+      const result = invoke(
+        scan === 1
+          ? async () => {
+              await releasePreparation.promise;
+              return input;
             }
-            const retained = new URL(url);
-            retained.searchParams.set("disk-budget-test-generation", "sdk-fixture-drain");
-            return retained;
-          });
-          const storePath = path.join(state.sessionsDir(), "sessions.json");
-          const scope = {
-            agentId: "main",
-            env: state.env,
-            storePath,
-            sessionKey: "agent:main:fixture",
-          };
-          const releasePreparation = createDeferredCore();
-          const mutationBodyFinished = createDeferredCore<boolean>();
-          const secondScanAdmitted = createDeferredCore();
-          const nativeRetired = createDeferredCore();
-          const releaseRetirement = createDeferredCore();
-          let scans = 0;
-          let observedSdkSweeps = 0;
-          let scanSpy = vi.spyOn(WorkerTaskPool.prototype, "run");
-          scanSpy.mockImplementation(function trackScan(
-            this: WorkerTaskPool<unknown, unknown>,
-            input,
-            options,
-          ) {
-            scanSpy.mockRestore();
-            const invoke = this.run.bind(this);
-            scanSpy = vi.spyOn(WorkerTaskPool.prototype, "run").mockImplementation(trackScan);
-            if (input !== storePath) {
-              return invoke(input, options);
-            }
-            const scan = ++scans;
-            const result = invoke(
-              scan === 1
-                ? async () => {
-                    await releasePreparation.promise;
-                    return input;
-                  }
-                : input,
-              options,
-            );
-            if (scan === 2) {
-              secondScanAdmitted.resolve();
-            }
-            return result;
-          });
-          let retirement: MockInstance<Worker["terminate"]> | undefined;
-          const diskWorkerUrl = resolveRuntimeWorkerUrl({
-            currentModuleUrl: import.meta.url,
-            sourceWorkerName: "disk-budget.worker",
-            distWorkerPath: "config/sessions/disk-budget.worker.js",
-          });
-          const createWorker = workerCpu.createCpuTrackedWorker;
-          const workerCreation = vi
-            .spyOn(workerCpu, "createCpuTrackedWorker")
-            .mockImplementation((filename, options) => {
-              const worker = createWorker(filename, options);
-              if (!retirement && String(filename) === diskWorkerUrl.href) {
-                const terminate = worker.terminate.bind(worker);
-                retirement = vi.spyOn(worker, "terminate").mockImplementationOnce(async () => {
-                  const code = await terminate();
-                  nativeRetired.resolve();
-                  await releaseRetirement.promise;
-                  return code;
-                });
-              }
-              return worker;
-            });
-          const mutation = withSessionHistoryBudgetSweepsForTest(async () => {
-            try {
-              await upsertSessionEntry({
-                ...scope,
-                entry: { sessionId: "fixture-session", updatedAt: Date.now() },
-              });
-              expect(
-                await deleteSessionEntry({ ...scope, expectedSessionId: "fixture-session" }),
-              ).toBe(true);
-              expect(vi.isMockFunction(storeWriterQueue.runQueuedStoreWrite)).toBe(true);
-              observedSdkSweeps = vi
-                .mocked(storeWriterQueue.runQueuedStoreWrite)
-                .mock.calls.filter(
-                  ([params]) => params.label === "enforceSqliteSessionHistoryDiskBudget",
-                ).length;
-              expect(
-                observedSdkSweeps,
-                "Actual SDK mutations must reach the canonical observed queue",
-              ).toBeGreaterThan(0);
-              expect(scans).toBe(1);
-              mutationBodyFinished.resolve(true);
-            } catch (error) {
-              mutationBodyFinished.resolve(false);
-              throw error;
-            }
-          });
-          let drainage: Promise<void> | undefined;
-          try {
-            if (!(await mutationBodyFinished.promise)) {
-              releasePreparation.resolve();
-              await mutation;
-            }
-            drainage = (async () => {
-              await mutation;
-              await drainSessionDiskBudgetWorkers();
-            })();
-            releasePreparation.resolve();
-            await Promise.all([nativeRetired.promise, secondScanAdmitted.promise]);
-            releaseRetirement.resolve();
-            await drainage;
-            await closeOpenClawAgentDatabasesAsync();
-            await closeOpenClawStateDatabaseAsync();
-            expect(scans).toBe(2);
-          } finally {
-            releasePreparation.resolve();
-            releaseRetirement.resolve();
-            await Promise.allSettled([mutation, drainage]);
-            retirement?.mockRestore();
-            workerCreation.mockRestore();
-            scanSpy.mockRestore();
-            await closeOpenClawAgentDatabasesAsync();
-            await closeOpenClawStateDatabaseAsync();
-            await drainSessionDiskBudgetWorkers();
-          }
-        },
-        async () => {},
+          : input,
+        options,
       );
-      const liveThreadIds = workers.map((worker) => worker.threadId).filter((id) => id !== -1);
-      expect(liveThreadIds, "SDK fixture drainage must leave no live native worker").toEqual([]);
-    } finally {
-      await state.cleanup();
-    }
+      if (scan === 2) {
+        secondScanAdmitted.resolve();
+      }
+      return result;
+    });
+    let retirement: MockInstance<Worker["terminate"]> | undefined;
+    const diskWorkerUrl = resolveRuntimeWorkerUrl({
+      currentModuleUrl: import.meta.url,
+      sourceWorkerName: "disk-budget.worker",
+      distWorkerPath: "config/sessions/disk-budget.worker.js",
+    });
+    const stateReadUrl = resolveRuntimeProcessEntrypointUrl("stateRead");
+    const ownedStateReadPath = state.path("sdk-drainage-state-read.mjs");
+    await fs.writeFile(ownedStateReadPath, `export * from ${JSON.stringify(stateReadUrl.href)};\n`);
+    const ownedStateReadUrl = pathToFileURL(ownedStateReadPath);
+    const createWorker = workerCpu.createCpuTrackedWorker;
+    const workerCreation = vi
+      .spyOn(workerCpu, "createCpuTrackedWorker")
+      .mockImplementation((filename, options) => {
+        const worker = createWorker(filename, options);
+        if (!retirement && String(filename) === diskWorkerUrl.href) {
+          const terminate = worker.terminate.bind(worker);
+          retirement = vi.spyOn(worker, "terminate").mockImplementationOnce(async () => {
+            const code = await terminate();
+            nativeRetired.resolve();
+            await releaseRetirement.promise;
+            return code;
+          });
+        }
+        return worker;
+      });
+    await withRuntimeWorkerGeneration(async (bind) => {
+      // Only the shared-state helper joins this generation; disk scans keep their own drain.
+      bind((url) => (url.href === stateReadUrl.href ? ownedStateReadUrl : url));
+      const mutation = withSessionHistoryBudgetSweepsForTest(async () => {
+        try {
+          await upsertSessionEntry({
+            ...scope,
+            entry: { sessionId: "fixture-session", updatedAt: Date.now() },
+          });
+          expect(await deleteSessionEntry({ ...scope, expectedSessionId: "fixture-session" })).toBe(
+            true,
+          );
+          expect(vi.isMockFunction(storeWriterQueue.runQueuedStoreWrite)).toBe(true);
+          observedSdkSweeps = vi
+            .mocked(storeWriterQueue.runQueuedStoreWrite)
+            .mock.calls.filter(
+              ([params]) => params.label === "enforceSqliteSessionHistoryDiskBudget",
+            ).length;
+          expect(
+            observedSdkSweeps,
+            "Actual SDK mutations must reach the canonical observed queue",
+          ).toBeGreaterThan(0);
+          expect(scans).toBe(1);
+          mutationBodyFinished.resolve(true);
+        } catch (error) {
+          mutationBodyFinished.resolve(false);
+          throw error;
+        }
+      });
+      let drainage: Promise<void> | undefined;
+      try {
+        if (!(await mutationBodyFinished.promise)) {
+          releasePreparation.resolve();
+          await mutation;
+        }
+        drainage = (async () => {
+          await mutation;
+          await drainSessionDiskBudgetWorkers();
+        })();
+        releasePreparation.resolve();
+        await Promise.all([nativeRetired.promise, secondScanAdmitted.promise]);
+        releaseRetirement.resolve();
+        await drainage;
+        await closeOpenClawAgentDatabasesAsync();
+        await closeOpenClawStateDatabaseAsync();
+        expect(scans).toBe(2);
+      } finally {
+        releasePreparation.resolve();
+        releaseRetirement.resolve();
+        await Promise.allSettled([mutation, drainage]);
+        retirement?.mockRestore();
+        workerCreation.mockRestore();
+        scanSpy.mockRestore();
+        await closeOpenClawAgentDatabasesAsync();
+        await closeOpenClawStateDatabaseAsync();
+        await drainSessionDiskBudgetWorkers();
+      }
+    }, state.cleanup);
+    const liveThreadIds = workers.map((worker) => worker.threadId).filter((id) => id !== -1);
+    expect(liveThreadIds, "SDK fixture drainage must leave no live native worker").toEqual([]);
   });
 
   it("joins a measurement admitted after drainage starts before retiring its worker", async () => {
