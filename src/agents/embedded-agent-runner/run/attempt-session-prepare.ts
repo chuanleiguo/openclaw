@@ -55,6 +55,7 @@ import {
   type InitialUserTurnReplayPreparation,
   preparePersistedCurrentUserTurn,
   reconcilePrePersistedCurrentUserTurn,
+  reconcileForeignPendingUserTurn,
 } from "./pre-persisted-user-turn.js";
 import { resolveSessionBoundaryPromptCacheKey } from "./session-boundary-prompt-cache-key.js";
 import { resolveEmbeddedSessionContextLimits } from "./session-context-limits.js";
@@ -426,7 +427,16 @@ export async function prepareEmbeddedAttemptSessionBoundary(input: {
       durableUserTurnMessage: orphanRepairCandidate?.messageEntry.message,
       userTurnAlreadyPersisted: attempt.userTurnTranscriptRecorder?.hasPersisted() === true,
     });
-  const orphanRepair = reconciledCurrentUser ? undefined : orphanRepairCandidate;
+  const omitForeignInput =
+    !reconciledCurrentUser && orphanRepairCandidate
+      ? reconcileForeignPendingUserTurn({
+          activeSession,
+          target: sessionManager.getSessionTarget(),
+          entry: orphanRepairCandidate.messageEntry,
+        })
+      : undefined;
+  const orphanRepair =
+    reconciledCurrentUser || omitForeignInput ? undefined : orphanRepairCandidate;
   if (orphanRepair?.removeLeaf) {
     const repairedTarget = await withSessionManagerWrite(sessionManager, async () => {
       input.abortSignal?.throwIfAborted();
@@ -496,7 +506,10 @@ export async function prepareEmbeddedAttemptSessionBoundary(input: {
   if (typeof activeSession.agent.convertToLlm === "function") {
     const baseConvertToLlm = activeSession.agent.convertToLlm.bind(activeSession.agent);
     activeSession.agent.convertToLlm = async (messages) => {
-      const normalized = normalizeMessagesForLlmBoundary(messages, buildBoundaryOptions());
+      const normalized = normalizeMessagesForLlmBoundary(
+        omitForeignInput?.(messages) ?? messages,
+        buildBoundaryOptions(),
+      );
       const converted = await baseConvertToLlm(
         // Persisted carriers stay after their user turn, including during tool loops;
         // moving one would change the prefix bound to later thinking signatures.

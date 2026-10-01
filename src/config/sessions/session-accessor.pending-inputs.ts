@@ -48,6 +48,7 @@ import {
   readSessionPendingInputByKey,
   readSessionPendingInputOwnerIds,
   registerSessionPendingInputOwner,
+  hasForeignLiveSessionPendingInputOwner,
   finishSessionPendingInputOwner,
   runWithSessionPendingInput,
   runWithSessionPendingInputPersistence,
@@ -73,6 +74,14 @@ import { transcriptEventReadBytesSql } from "./session-transcript-read-bytes.js"
 import { readMessageIdempotencyKey } from "./transcript-message-identity.js";
 
 export { withSessionPendingInputRelocation };
+
+/** Inspect live custody without reopening storage or relying on consumed pending rows. */
+export function isSessionTranscriptEntryOwnedByAnotherPendingInput(
+  scope: SessionAccessScope & { sessionId: string },
+  entryId: string,
+): boolean {
+  return hasForeignLiveSessionPendingInputOwner(resolveSqliteTranscriptScope(scope), entryId);
+}
 export type { SessionPendingInput, SessionPendingInputPage };
 type PendingInputScope = SessionAccessScope & { agentId: string; sessionId: string };
 export type SessionPendingInputReceipt = {
