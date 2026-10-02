@@ -1,16 +1,26 @@
 import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.js";
-import type { SessionPendingInputOwner } from "./session-accessor.sqlite-pending-inputs.js";
 import {
   toDatabaseOptions,
   type ResolvedTranscriptScope,
 } from "./session-accessor.sqlite-scope.js";
 
+type LiveInputIdentity<Owner> = {
+  promotedOwner?: Owner;
+  databasePath: string;
+  sessionId: string;
+  sessionKey: string;
+  transcriptInputId: string;
+  idempotencyKey: string;
+};
+
 /** A promoted input can outlive its pending row while another turn still owns it. */
-export function collectForeignLiveSessionPendingInputEntries(params: {
+export function collectForeignLiveSessionPendingInputEntries<
+  Owner extends LiveInputIdentity<Owner>,
+>(params: {
   scope: ResolvedTranscriptScope;
-  liveOwners: Iterable<SessionPendingInputOwner>;
-  currentOwner: SessionPendingInputOwner | undefined;
-  assertCurrent: (owner: SessionPendingInputOwner) => void;
+  liveOwners: Iterable<Owner>;
+  currentOwner: Owner | undefined;
+  assertCurrent: (owner: Owner) => void;
 }): ReadonlyMap<string, string> {
   const entries = new Map<string, string>();
   const databasePath = resolveOpenClawAgentSqlitePath(toDatabaseOptions(params.scope));
