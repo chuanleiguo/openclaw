@@ -63,6 +63,7 @@ import {
   type InitialUserTurnReplayPreparation,
   preparePersistedCurrentUserTurn,
   reconcilePrePersistedCurrentUserTurn,
+  reconcileForeignPendingUserTurns,
 } from "./pre-persisted-user-turn.js";
 import { resolveSessionBoundaryPromptCacheKey } from "./session-boundary-prompt-cache-key.js";
 import { resolveEmbeddedSessionContextLimits } from "./session-context-limits.js";
@@ -348,7 +349,18 @@ export async function prepareEmbeddedAttemptSessionBoundary(input: {
       durableUserTurnMessage: orphanRepairCandidate?.messageEntry.message,
       userTurnAlreadyPersisted: attempt.userTurnTranscriptRecorder?.hasPersisted() === true,
     });
-  const orphanRepair = reconciledCurrentUser ? undefined : orphanRepairCandidate;
+  const foreignInputs = preserveExactPrompt
+    ? undefined
+    : reconcileForeignPendingUserTurns({
+        activeSession,
+        target: sessionManager.getSessionTarget(),
+        currentUserIdempotencyKey: currentUserTurnMessage?.idempotencyKey,
+      });
+  const orphanRepair =
+    reconciledCurrentUser ||
+    (orphanRepairCandidate && foreignInputs?.ownsEntry(orphanRepairCandidate.messageEntry.id))
+      ? undefined
+      : orphanRepairCandidate;
   if (orphanRepair?.removeLeaf) {
     const repairedTarget = await withSessionManagerWrite(sessionManager, async () => {
       input.abortSignal?.throwIfAborted();
@@ -420,12 +432,15 @@ export async function prepareEmbeddedAttemptSessionBoundary(input: {
   const baseConvertToLlm = activeSession.agent.convertToLlm.bind(activeSession.agent);
   activeSession.agent.convertToLlm = async (messages) => {
     let removedRuntimeContext: AgentMessage[] | undefined;
-    const normalized = normalizeMessagesForLlmBoundary(messages, {
-      ...buildBoundaryOptions(),
-      onRuntimeContextCarrierRemoved: (removed) => {
-        removedRuntimeContext = removed;
+    const normalized = normalizeMessagesForLlmBoundary(
+      foreignInputs?.omitInput(messages) ?? messages,
+      {
+        ...buildBoundaryOptions(),
+        onRuntimeContextCarrierRemoved: (removed) => {
+          removedRuntimeContext = removed;
+        },
       },
-    });
+    );
     const converted = await baseConvertToLlm(
       // Persisted carriers stay after their user turn, including during tool loops;
       // moving one would change the prefix bound to later thinking signatures.

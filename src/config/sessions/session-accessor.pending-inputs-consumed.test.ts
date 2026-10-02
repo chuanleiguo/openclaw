@@ -23,6 +23,7 @@ import {
 } from "./session-accessor.js";
 import {
   bindSessionPendingInputSources,
+  getForeignLiveSessionPendingInputEntries,
   listSessionPendingInputs,
   readSessionPendingInput,
   stageSessionPendingInput,
@@ -96,6 +97,14 @@ describe("committed pending input release", () => {
     closeOpenClawAgentDatabasesForTest();
   });
 
+  it("retires promoted transcript protection on lifecycle rotation", async () => {
+    const receipt = await stage("rotated-input");
+    const promoted = expectDefined(await promote(receipt), "Expected promoted input");
+    expect(getForeignLiveSessionPendingInputEntries(scope()).has(promoted.messageId)).toBe(true);
+    rotateAgentEventLifecycleGeneration();
+    expect(getForeignLiveSessionPendingInputEntries(scope()).has(promoted.messageId)).toBe(false);
+  });
+
   it.each([false, true])(
     "permits only exact committed persistence after custody closes (collected: %s)",
     async (collected) => {
@@ -107,7 +116,18 @@ describe("committed pending input release", () => {
         receipts.push(receipt);
       }
       await promote(receipt);
+      expect(getForeignLiveSessionPendingInputEntries(scope()).has(receipt.inputId)).toBe(true);
+      expect(
+        receipt.run(() => getForeignLiveSessionPendingInputEntries(scope()).has(receipt.inputId)),
+      ).toBe(false);
+      expect(
+        getForeignLiveSessionPendingInputEntries({ ...scope(), sessionId: "other-session" }).has(
+          receipt.inputId,
+        ),
+      ).toBe(false);
+      expect(getForeignLiveSessionPendingInputEntries(scope()).has("other-entry")).toBe(false);
       receipt.finish("cancelled");
+      expect(getForeignLiveSessionPendingInputEntries(scope()).has(receipt.inputId)).toBe(false);
       expect(() => receipt.run(() => {})).toThrow("ownership ended");
       const before = await loadTranscriptEvents(scope());
       expect(

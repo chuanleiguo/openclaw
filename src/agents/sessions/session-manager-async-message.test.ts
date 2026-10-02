@@ -7,6 +7,7 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import {
   bindSessionPendingInputSources,
+  getForeignLiveSessionPendingInputEntries,
   stageSessionPendingInput,
   withSessionPendingInputPersistence,
 } from "../../config/sessions/session-accessor.pending-inputs.js";
@@ -304,9 +305,14 @@ it.each([false, true])(
         Array(sources.length + 1).fill("consumed"),
       );
       expect(beforeFreshMessageCommit).not.toHaveBeenCalled();
+      expect(getForeignLiveSessionPendingInputEntries(target).has(receipt.inputId)).toBe(true);
+      expect(
+        receipt.run(() => getForeignLiveSessionPendingInputEntries(target).has(receipt.inputId)),
+      ).toBe(false);
       const events = await loadTranscriptEvents(target);
       expect(events).toEqual(manager.getPersistedEntries());
       receipt.finish("cancelled");
+      expect(getForeignLiveSessionPendingInputEntries(target).has(receipt.inputId)).toBe(false);
       await expect(
         withSessionPendingInputPersistence(receipt, () =>
           manager.appendMessageWithTranscriptAnchorAsync(receipt.message, {

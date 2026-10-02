@@ -1,10 +1,12 @@
 import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage } from "../../../../packages/agent-core/src/types.js";
 import {
+  type SessionTranscriptRuntimeTarget,
   loadSessionEntry,
   loadTranscriptHeaderSync,
   type SessionTranscriptWriteScope,
 } from "../../../config/sessions/session-accessor.js";
+import { getForeignLiveSessionPendingInputEntries } from "../../../config/sessions/session-accessor.pending-inputs.js";
 import { validateSessionTranscriptContextVersion } from "../../../config/sessions/session-accessor.sqlite-model-context.js";
 import {
   captureOwnedTranscriptWriteAssertion,
@@ -201,4 +203,40 @@ export function reconcilePrePersistedCurrentUserTurn(params: {
     durableTurnMatches ||
     params.currentUserTurnMessage?.excludeFromContext === true
   );
+}
+
+/** Keep live foreign turns durable while excluding them from this attempt and context rebuilds. */
+export function reconcileForeignPendingUserTurns(params: {
+  activeSession: { agent: { state: { messages: AgentMessage[] } } };
+  target: SessionTranscriptRuntimeTarget | undefined;
+  currentUserIdempotencyKey: string | undefined;
+}):
+  | {
+      ownsEntry: (entryId: string) => boolean;
+      omitInput: (messages: AgentMessage[]) => AgentMessage[];
+    }
+  | undefined {
+  if (!params.target) {
+    return undefined;
+  }
+  const entries = getForeignLiveSessionPendingInputEntries(params.target);
+  if (entries.size === 0) {
+    return undefined;
+  }
+  // Keep the declared current prompt visible before receipt scope entry, while its row stays protected.
+  const keys = new Set(
+    [...entries.values()].filter((key) => key !== params.currentUserIdempotencyKey),
+  );
+  const omitInput = (messages: AgentMessage[]) =>
+    messages.filter(
+      (message) =>
+        !(
+          message.role === "user" &&
+          "idempotencyKey" in message &&
+          typeof message.idempotencyKey === "string" &&
+          keys.has(message.idempotencyKey)
+        ),
+    );
+  params.activeSession.agent.state.messages = omitInput(params.activeSession.agent.state.messages);
+  return { ownsEntry: (entryId: string) => entries.has(entryId), omitInput };
 }
