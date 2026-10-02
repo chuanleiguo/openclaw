@@ -6,13 +6,14 @@ import {
 import { retireSessionMcpRuntime } from "../../agents/agent-bundle-mcp-tools.js";
 import { resolveAgentWorkspaceDir, resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { clearBootstrapSnapshotOnSessionBoundary } from "../../agents/bootstrap-cache.js";
-import { clearAllCliSessions, getCliSessionBinding } from "../../agents/cli-session.js";
+import { clearAllCliSessions } from "../../agents/cli-session.js";
 import { resetRegisteredAgentHarnessSessions } from "../../agents/harness/registry.js";
 import { cleanupBrowserSessionsForLifecycleEnd } from "../../browser-lifecycle-cleanup.js";
 import { normalizeChatType } from "../../channels/chat-type.js";
 import { readConversationBindingRouteFacts } from "../../channels/conversation-binding-route-facts.js";
 import { resolveSessionParentSessionKey } from "../../channels/plugins/session-conversation.js";
 import { conversationRouteContextFromMsgContext } from "../../config/sessions/conversation-route-context.js";
+import { hasProviderOwnedSession } from "../../config/sessions/entry-freshness.js";
 import { resolveGroupSessionKey } from "../../config/sessions/group.js";
 import {
   hasTerminalMainSessionTranscriptNewerThanRegistry,
@@ -37,7 +38,10 @@ import {
   loadReplySessionInitializationSnapshot,
 } from "../../config/sessions/session-accessor.js";
 import { sessionEntryForkedFromParent } from "../../config/sessions/session-entry-lineage.js";
-import { buildSessionCreationStamp } from "../../config/sessions/session-entry-provenance.js";
+import {
+  buildSessionCreationStamp,
+  preserveCreationStamp,
+} from "../../config/sessions/session-entry-provenance.js";
 import { selectSessionModelOverride } from "../../config/sessions/session-entry-selection.js";
 import { resolveSessionKey } from "../../config/sessions/session-key.js";
 import { resolveSessionStorePathForScope } from "../../config/sessions/session-store-path.js";
@@ -131,9 +135,9 @@ import {
 import { createReplySessionEntryHandle } from "./session-entry-handle.js";
 import { projectSessionEntryLifecycleCarry } from "./session-entry-lifecycle-carry.js";
 import {
-  buildSessionStartHookPayload,
   createReplySessionResetBoundary,
   emitReplySessionEndHook,
+  emitReplySessionStartHook,
   resolveExplicitSessionEndReason,
   resolveStaleSessionEndReason,
 } from "./session-hooks.js";
@@ -155,11 +159,6 @@ import { resolveAuthorizedSessionResetCommand } from "./session-reset-command.js
 import { stripThreadFromSessionRoute, stripThreadId } from "./session-route-reset.js";
 
 const log = createSubsystemLogger("session-init");
-
-function hasProviderOwnedSession(entry: SessionEntry | undefined): boolean {
-  const provider = normalizeOptionalString(entry?.providerOverride ?? entry?.modelProvider);
-  return Boolean(provider && getCliSessionBinding(entry, provider));
-}
 
 type InitSessionStateParams = {
   providerReviewAcknowledgment?: import("../../sessions/provider-review.js").ProviderReviewAcknowledgment;
@@ -323,13 +322,10 @@ function resolveReplySessionRolloverState(
     parentSessionId: entry.parentSessionId,
     forkedFromParent: entry.forkedFromParent,
     forkSource: entry.forkSource,
-    createdVia: entry.createdVia,
-    createdActor: entry.createdActor,
-    createdAt: entry.createdAt,
+    ...preserveCreationStamp({}, entry),
     // Chat preferences survive rollover; native-runtime consent belongs to the old incarnation.
     permissionMode: entry.permissionMode,
     sandboxMode: entry.sandboxMode,
-    ...(entry.sandbox === "required" ? { sandbox: "required" } : {}),
   };
 }
 
@@ -1255,15 +1251,12 @@ async function initSessionStateAttemptLocked(
       });
     }
     if (hookRunner.hasHooks("session_start")) {
-      const payload = buildSessionStartHookPayload({
+      emitReplySessionStartHook(hookRunner, {
         sessionId: effectiveSessionId,
         sessionKey,
         agentId,
         resumedFrom: previousSessionEntry?.sessionId,
       });
-      void runWithGatewayIndependentRootWorkContinuation(async () => {
-        await hookRunner.runSessionStart(payload.event, payload.context);
-      }, "hooks:session-start").catch(() => {});
     }
   }
 

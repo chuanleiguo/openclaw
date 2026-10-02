@@ -37,7 +37,8 @@ import { bumpGatewayAccessRevision } from "../gateway-access-revision.js";
 import { getGatewayLocalUserIngress } from "../local-user-ingress.js";
 import { projectSessionActor } from "../session-identity-projection.js";
 import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
-import { getSessionRowProjection } from "../session-row-projection-access.js";
+import { requireSessionRowProjection } from "../session-row-projection-access.js";
+import { captureSessionMutationRouting } from "../session-sharing-preparation.js";
 import {
   allowedSessionVisibilities,
   canManageSessionSharing,
@@ -236,10 +237,7 @@ function createSessionMembersListHandler(
     if (!managed) {
       return;
     }
-    const projection = getSessionRowProjection(context);
-    if (!projection) {
-      throw new Error("Session projection is unavailable before Gateway startup completes");
-    }
+    const projection = requireSessionRowProjection(context);
     const profiles = await measureSessionCollaborationPhase(`${method}.profiles`, () =>
       listProfiles(),
     );
@@ -542,13 +540,26 @@ export const sessionSharingHandlers: GatewayRequestHandlers = {
   "session.members.list": createSessionMembersListHandler("session.members.list"),
   "session.members.listEvidence": createSessionMembersListHandler("session.members.listEvidence"),
 
-  "session.members.add": async ({ params, respond, client, context }) => {
+  "session.members.add": async ({
+    params,
+    respond,
+    client,
+    context,
+    signal,
+    sessionMutationAuthorization,
+  }) => {
     if (
       !assertValidParams(params, validateSessionMemberAddParams, "session.members.add", respond)
     ) {
       return;
     }
     const cfg = context.getRuntimeConfig();
+    const assertRoutingCurrent = captureSessionMutationRouting(cfg);
+    const assertRequestCurrent = () => {
+      signal?.throwIfAborted();
+      sessionMutationAuthorization?.assertCurrent();
+      assertRoutingCurrent(context.getRuntimeConfig());
+    };
     const managed = requireManageableTarget({
       cfg,
       client,
@@ -559,14 +570,12 @@ export const sessionSharingHandlers: GatewayRequestHandlers = {
     if (!managed) {
       return;
     }
-    const projection = getSessionRowProjection(context);
-    if (!projection) {
-      throw new Error("Session projection is unavailable before Gateway startup completes");
-    }
+    const projection = requireSessionRowProjection(context);
     const profiles = await listProfiles();
     do {
       await projection.ensureMaterialized();
     } while (projection.needsMaterialization);
+    assertRequestCurrent();
     requireCurrentManagedTarget({
       cfg: context.getRuntimeConfig(),
       client,
@@ -604,6 +613,7 @@ export const sessionSharingHandlers: GatewayRequestHandlers = {
           expectedEntry: sharingExpectedEntry(current),
         },
         () => {
+          assertRequestCurrent();
           assertCurrentSharingManager({ context, client, target: current });
         },
       );
@@ -633,8 +643,14 @@ export const sessionSharingHandlers: GatewayRequestHandlers = {
   "session.members.remove": defineValidatedGatewayHandler(
     "session.members.remove",
     validateSessionMemberRemoveParams,
-    async ({ params, respond, client, context }) => {
+    async ({ params, respond, client, context, signal, sessionMutationAuthorization }) => {
       const cfg = context.getRuntimeConfig();
+      const assertRoutingCurrent = captureSessionMutationRouting(cfg);
+      const assertRequestCurrent = () => {
+        signal?.throwIfAborted();
+        sessionMutationAuthorization?.assertCurrent();
+        assertRoutingCurrent(context.getRuntimeConfig());
+      };
       const managed = requireManageableTarget({
         cfg,
         client,
@@ -658,6 +674,7 @@ export const sessionSharingHandlers: GatewayRequestHandlers = {
           undefined,
           current.entry.sessionId,
           () => {
+            assertRequestCurrent();
             assertCurrentSharingManager({ context, client, target: current });
           },
           sharingExpectedEntry(current),

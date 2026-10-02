@@ -42,11 +42,14 @@ describe("live pending inputs at the attempt boundary", () => {
           storePath: path.join(state.sessionsDir(), "sessions.json"),
         };
         await upsertSessionEntryCore(target, { sessionId: target.sessionId, updatedAt: 1 });
-        const manager = guardSessionManager(SessionManager.open(target, state.workspaceDir), {
-          runId: "prior-run",
-        });
+        const manager = guardSessionManager(
+          await SessionManager.openAsync(target, state.workspaceDir),
+          {
+            runId: "prior-run",
+          },
+        );
         const prior = createAssistant(testModel, [{ type: "text", text: "prior reply" }]);
-        manager.appendMessage(prior);
+        await manager.appendMessageAsync(prior);
         const message: Parameters<typeof stageSessionPendingInput>[1]["message"] = {
           role: "user",
           content: "queued user request",
@@ -87,9 +90,9 @@ describe("live pending inputs at the attempt boundary", () => {
             "Expected promoted input",
           );
           expect(promoted).toMatchObject({ appended: true });
-          expect(listSessionPendingInputs(target).items).toEqual([]);
+          expect((await listSessionPendingInputs(target)).items).toEqual([]);
           const announce = guardSessionManager(
-            SessionManager.openBounded(target, { maxBytes: 8192, maxEvents: 30 }),
+            await SessionManager.openBoundedAsync(target, { maxBytes: 8192, maxEvents: 30 }),
             { runId: "announce-run" },
           );
           if (metadata) {
@@ -108,7 +111,11 @@ describe("live pending inputs at the attempt boundary", () => {
           });
           const boundary = await prepareEmbeddedAttemptSessionBoundary({
             activeSession,
-            attempt: { prompt: "announce child result" },
+            attempt: {
+              prompt: "announce child result",
+              sessionId: target.sessionId,
+              sessionKey: target.sessionKey,
+            },
             getUserTranscriptContexts: () => undefined,
             isRawModelRun: false,
             preparedUserTurnMessage: undefined,
@@ -145,7 +152,10 @@ describe("live pending inputs at the attempt boundary", () => {
               appendTranscriptMessage(target, { message: receipt.message }),
             ),
           ).resolves.toMatchObject({ appended: false, messageId: promoted.messageId });
-          const reopened = SessionManager.openBounded(target, { maxBytes: 8192, maxEvents: 30 });
+          const reopened = await SessionManager.openBoundedAsync(target, {
+            maxBytes: 8192,
+            maxEvents: 30,
+          });
           expect(
             reopened.getBranch().filter((entry) => entry.id === promoted.messageId),
           ).toHaveLength(excluded ? 0 : 1);
@@ -159,7 +169,7 @@ describe("live pending inputs at the attempt boundary", () => {
               "Synthetic admission revoked",
             );
             expect(streamMocks.streamSimple).toHaveBeenCalledOnce();
-            expect(SessionManager.open(target).getBranch()).toEqual(before);
+            expect((await SessionManager.openAsync(target)).getBranch()).toEqual(before);
           } else if (!excluded) {
             const { session: original } = await createTestSession({
               model: testModel,
@@ -179,6 +189,8 @@ describe("live pending inputs at the attempt boundary", () => {
                 activeSession: original,
                 attempt: {
                   prompt: "queued user request",
+                  sessionId: target.sessionId,
+                  sessionKey: target.sessionKey,
                   userTurnTranscriptRecorder: recorder,
                 },
                 getUserTranscriptContexts: () => undefined,
@@ -205,7 +217,7 @@ describe("live pending inputs at the attempt boundary", () => {
             expect(originalContext.match(/queued user request/g)).toHaveLength(1);
             expect(originalContext).toContain("announce child result");
             expect(
-              SessionManager.open(target)
+              (await SessionManager.openAsync(target))
                 .getBranch()
                 .filter((entry) => entry.id === promoted.messageId),
             ).toHaveLength(1);
