@@ -26,6 +26,11 @@ import type {
   SessionPendingInputAuthorityFacts,
 } from "./session-pending-input-authority.js";
 import { SessionPendingInputCustodyError } from "./session-pending-input-custody-error.js";
+import {
+  assertLiveSessionPendingInputLifetimeCurrent,
+  prepareForeignLiveSessionPendingInputEntries,
+  publishConsumedSessionPendingInputSources,
+} from "./session-pending-input-live-owner.js";
 import type { SessionPendingInputState } from "./session-pending-input-receipt.types.js";
 
 export type SessionPendingInput = {
@@ -62,6 +67,8 @@ export type SessionPendingInputOwner = {
   authority?: SessionPendingInputAuthority;
   /** Published only after the exact input was consumed by a committed transcript write. */
   consumed?: true;
+  /** The committed aggregate retains its source owners until their turn finishes. */
+  promotedOwner?: SessionPendingInputOwner;
   /** Prompt authority is revoked; this owner still holds terminal disposition custody. */
   settling?: true;
   finish: (disposition: Exclude<SessionPendingInputState, "queued">) => void;
@@ -129,11 +136,7 @@ export function captureSessionPendingInputWorkerCustody() {
     publish(receipt: SessionPendingInputWorkerReceipt) {
       owner.transcriptInputId = receipt.transcriptInputId;
       const consumed = new Set(receipt.consumedInputIds);
-      for (const source of owner.sources ?? [owner]) {
-        if (consumed.has(source.inputId)) {
-          source.consumed = true;
-        }
-      }
+      publishConsumedSessionPendingInputSources(owner, owner.sources ?? [owner], consumed);
     },
   };
 }
@@ -277,14 +280,21 @@ function assertPendingInputOwnerCurrent(
 }
 
 export function assertSessionPendingInputLifetimeCurrent(owner: SessionPendingInputOwner): void {
-  if (owner.sources) {
-    for (const source of owner.sources) {
-      assertSessionPendingInputLifetimeCurrent(source);
-    }
-    return;
-  }
-  assertPendingInputOwnerActive(owner);
-  (owner.authority?.assertLifetimeCurrent ?? owner.assertCurrent)();
+  assertLiveSessionPendingInputLifetimeCurrent(owner, assertPendingInputOwnerActive);
+}
+
+export function getForeignLiveSessionPendingInputEntriesInScope(
+  scope: ResolvedTranscriptScope,
+  signal?: AbortSignal,
+): Promise<ReadonlyMap<string, string>> {
+  return prepareForeignLiveSessionPendingInputEntries({
+    scope,
+    liveOwners: () => owners.live.values(),
+    currentOwner: owners.current.getStore(),
+    assertLifetimeCurrent: assertSessionPendingInputLifetimeCurrent,
+    assertCurrent: assertPendingInputOwnerCurrent,
+    signal,
+  });
 }
 
 export function runWithSessionPendingInput<T>(owner: SessionPendingInputOwner, run: () => T): T {
@@ -727,11 +737,7 @@ export function consumeSessionPendingInput(
         worker?.consumed.delete(consumedOwner.inputId);
       }
     },
-    commit: () => {
-      for (const consumedOwner of consumedOwners) {
-        consumedOwner.consumed = true;
-      }
-    },
+    commit: () => publishConsumedSessionPendingInputSources(owner, consumedOwners),
   });
 }
 
